@@ -23,7 +23,7 @@ from core.engine import handle_request
 st.set_page_config(
     page_title="SafeSpace AI",
     page_icon="🌿",
-    layout="wide",
+    layout="centered",
     initial_sidebar_state="expanded",
 )
 
@@ -63,10 +63,13 @@ st.markdown("""
     }
     .upload-label { font-size: 0.8rem; color: #5a7a5a; margin-bottom: 0.3rem; }
     #MainMenu {visibility: hidden;} footer {visibility: hidden;} header {visibility: hidden;}
-    /* Sidebar always visible */
-    [data-testid="stSidebar"] { min-width: 260px !important; max-width: 300px !important; }
-    /* Keep main content readable in wide layout */
-    .main .block-container { max-width: 800px; margin: 0 auto; padding-top: 1rem; }
+    /* Sidebar fixes */
+    [data-testid="stSidebar"] { min-width: 250px !important; }
+    [data-testid="stSidebar"] > div:first-child { padding-top: 1.5rem; }
+    /* Main chat area */
+    .main .block-container { padding-top: 1rem; padding-bottom: 2rem; }
+    /* Make chat messages full width in centered layout */
+    .stChatMessage { max-width: 100% !important; }
     .stButton > button {
         border-radius: 24px; background: #1a2e1a; color: white; border: none;
         padding: 0.5rem 1.5rem; font-family: 'DM Sans', sans-serif; font-weight: 500;

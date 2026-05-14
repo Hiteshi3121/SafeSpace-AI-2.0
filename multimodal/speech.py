@@ -81,5 +81,16 @@ async def transcribe_audio(audio_bytes: bytes, filename: str = "audio.ogg") -> s
         return text
 
     except Exception as e:
-        logger.exception("Transcription failed: %s", e)
-        return "I had trouble processing your voice message. Please try again or send a text message."
+        err_str = str(e)
+        logger.exception("Transcription failed: %s", err_str)
+        if "rate_limit" in err_str.lower() or "429" in err_str:
+            return (
+                "⚠️ Voice transcription is rate-limited right now. "
+                "Please wait a minute and try again, or type your message instead."
+            )
+        elif "invalid_api_key" in err_str.lower() or "401" in err_str:
+            return "⚠️ API key issue with voice transcription. Check GROQ_API_KEY in Space settings."
+        return (
+            "⚠️ Voice transcription failed. Please type your message instead. "
+            "You can try again in a few minutes."
+        )

@@ -41,11 +41,12 @@ async def describe_image(image_bytes: bytes, media_type: str = "image/jpeg") -> 
     Tries multiple Groq vision models in order of preference.
     """
     # Try models in order — Groq updates model names frequently
+    # Groq vision model IDs as of May 2026 — check console.groq.com/docs for updates
     models_to_try = [
         "meta-llama/llama-4-scout-17b-16e-instruct",
-        "meta-llama/llama-4-maverick-17b-128e-instruct",
         "llama-3.2-11b-vision-preview",
         "llama-3.2-90b-vision-preview",
+        "meta-llama/llama-4-maverick-17b-128e-instruct",
     ]
 
     b64_image = base64.b64encode(image_bytes).decode("utf-8")
@@ -81,11 +82,22 @@ async def describe_image(image_bytes: bytes, media_type: str = "image/jpeg") -> 
             return f"[Image analysis] {description}"
 
         except Exception as e:
-            logger.warning("Vision model %s failed: %s — trying next", model, e)
+            err_str = str(e)
+            if "rate_limit" in err_str.lower() or "429" in err_str:
+                logger.warning("Vision model %s: rate limited — trying next", model)
+            elif "model_not_found" in err_str.lower() or "404" in err_str:
+                logger.warning("Vision model %s: not found — trying next", model)
+            elif "invalid_api_key" in err_str.lower() or "401" in err_str:
+                logger.error("Groq API key invalid or missing vision permission")
+                return "⚠️ Vision API key issue. Please check GROQ_API_KEY in Space settings."
+            else:
+                logger.warning("Vision model %s failed: %s — trying next", model, err_str[:100])
             continue
 
-    logger.error("All vision models failed")
+    logger.error("All vision models failed for image analysis")
     return (
-        "I received your image but couldn't analyse it right now. "
-        "Could you describe what you're seeing in text?"
+        "⚠️ Image analysis is temporarily unavailable. "
+        "This usually means the vision AI is rate-limited or the model is updating. "
+        "Please describe your symptoms in text and I will help you. "
+        "You can try uploading the image again in a few minutes."
     )
