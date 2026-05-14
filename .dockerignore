@@ -1,51 +1,36 @@
-# ── .dockerignore ─────────────────────────────────────────────────────────────
-# Files excluded from Docker build context.
-# Smaller context = faster builds.
+# .dockerignore — tells Docker what NOT to copy into the build container
+# Be VERY careful here — if you accidentally ignore too much,
+# Docker gets an empty build context and can't find requirements.txt
 
-# Python
-__pycache__/
-*.py[cod]
-*.pyo
-.pytest_cache/
-*.egg-info/
-
-# Virtual environments
+# Virtual environment — never copy, Docker installs fresh from requirements.txt
 .venv/
 venv/
 env/
 
-# Environment files — NEVER bake secrets into image
-# Railway injects these as environment variables
-.env
-.env.*
-!.env.example
+# Python cache — not needed
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
 
-# Data — persisted via Railway volume or mounted locally
+# Local data — SQLite db is ephemeral on HF anyway
 data/
 *.db
-*.sqlite
-
-# Development files
-test_quick.py
-*.txt
-toml.txt
 
 # Git
 .git/
 .gitignore
 
-# IDE
-.vscode/
-.idea/
-*.swp
+# Local dev files — not needed in production
+.env
+debug_therapist.py
+deploy_to_hf.py
+fix_hf_upload.py
+docker-compose.yml
+railway.toml
 
-# OS
-.DS_Store
-Thumbs.db
-
-# Logs
+# Outputs and temp
+*.pdf
 *.log
-logs/
-
-# Node (just in case)
-node_modules/
+_README_bak.md
+HF_README.md
