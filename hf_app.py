@@ -1,42 +1,24 @@
 """
-hf_app.py  —  Hugging Face Spaces entry point
+hf_app.py — Hugging Face Spaces entry point
 
-HF Spaces runs:  streamlit run hf_app.py --server.port 7860
+HF runs: streamlit run hf_app.py --server.port 7860
 
-WHY THIS FILE EXISTS:
-  Our real Streamlit UI is at interfaces/streamlit_ui/app.py and
-  uses imports relative to the project root (e.g. from core.engine import ...).
-  This file sets up sys.path correctly before Streamlit boots,
-  then imports and runs the real app in the same process.
-
-  We use `exec` + file read (not runpy) to avoid Streamlit
-  re-registering set_page_config in a sub-module context,
-  which would throw a StreamlitAPIException.
-
-SECRETS to add in HF Space Settings → Repository Secrets:
-  GROQ_API_KEY          ← required
-  GOOGLE_MAPS_API_KEY   ← required for therapist finder
-  LANGSMITH_API_KEY     ← optional
-  LANGSMITH_PROJECT     ← optional (default: safespace-ai)
-  TWILIO_ACCOUNT_SID    ← optional (WhatsApp interface)
-  TWILIO_AUTH_TOKEN     ← optional
+FIX: When using exec() to run the child app, __file__ is not defined
+in the exec'd code's namespace. We pass it explicitly via globals dict.
 """
 
 import sys
 import os
 from pathlib import Path
 
-# ── 1. Add project root to sys.path ──────────────────────────────────────────
-ROOT = Path(__file__).parent.resolve()
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+# ── 1. Project root is always /app on HF Docker Spaces ───────────────────────
+ROOT = Path("/app")
+sys.path.insert(0, str(ROOT))
 
 # ── 2. Create data dir for SQLite ─────────────────────────────────────────────
 os.makedirs(str(ROOT / "data"), exist_ok=True)
 
-# ── 3. Inject env vars so CrewAI/LiteLLM can find them ───────────────────────
-# pydantic-settings loads .env into Settings() but does NOT write to os.environ.
-# CrewAI reads os.environ directly, so we bridge them here.
+# ── 3. Inject API keys into os.environ so CrewAI/LiteLLM can find them ───────
 try:
     from core.config import get_settings
     _s = get_settings()
@@ -52,7 +34,16 @@ try:
 except Exception as e:
     print(f"[hf_app] Warning: could not load settings: {e}")
 
-# ── 4. Execute the real Streamlit app in this process ────────────────────────
+# ── 4. Execute the real Streamlit app ─────────────────────────────────────────
+# We use exec() so Streamlit sees it as the main script.
+# IMPORTANT: pass __file__ explicitly — exec() doesn't set it automatically,
+# causing NameError in any code that uses Path(__file__).
 _app_path = ROOT / "interfaces" / "streamlit_ui" / "app.py"
 with open(_app_path, "r", encoding="utf-8") as _f:
-    exec(compile(_f.read(), str(_app_path), "exec"), {"__name__": "__main__"})
+    exec(
+        compile(_f.read(), str(_app_path), "exec"),
+        {
+            "__name__": "__main__",
+            "__file__": str(_app_path),   # ← THIS was missing, caused the error
+        }
+    )
