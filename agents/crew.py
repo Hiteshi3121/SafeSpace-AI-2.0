@@ -1,0 +1,240 @@
+"""
+agents/crew.py
+The CrewAI crew — wires all agents + tasks together.
+"""
+
+import asyncio
+import logging
+import os
+import re
+from crewai import Crew, Task, Process
+
+from agents.intent_classifier import classify_intent
+from agents.safety import create_safety_agent
+from agents.doctor import create_doctor_agent
+from agents.therapist import create_therapist_agent
+from core.schemas import ChatResponse, Intent, UserSession
+from core.config import get_settings
+from memory.store import format_history_for_llm
+
+# ── Inject API key into environment so CrewAI/LiteLLM can find it ────────────
+# CrewAI reads os.environ directly — it does NOT use the settings object.
+# Without this line the crew throws "Invalid API Key" even when .env is loaded.
+_settings = get_settings()
+os.environ.setdefault("GROQ_API_KEY", _settings.groq_api_key)
+
+logger = logging.getLogger(__name__)
+
+
+def _clean_crew_response(text: str) -> str:
+    """Remove LiteLLM/CrewAI artifacts from agent responses."""
+    # Remove math boxed format leak: $\boxed{...}$
+    text = re.sub(r'Your response should be in this format:.*?\\boxed\{[^}]*\}\.?\s*', '', text, flags=re.DOTALL)
+    text = re.sub(r'The final answer is:\s*\$\\boxed\{', '', text)
+    text = re.sub(r'\$\\boxed\{(.*?)\}\$', r'\1', text, flags=re.DOTALL)
+    text = re.sub(r'\\boxed\{(.*?)\}', r'\1', text, flags=re.DOTALL)
+    # Remove tool call leakage
+    text = re.sub(r'<function=\w+>.*?(?:</function>|$)', '', text, flags=re.DOTALL)
+    text = re.sub(r'\{"location":\s*"[^"]*".*?\}', '', text, flags=re.DOTALL)
+    # Remove "The final answer is:" preamble
+    text = re.sub(r'^The final answer is:\s*', '', text.strip())
+    return text.strip()
+
+
+# ── Greeting detection ────────────────────────────────────────────────────────
+GREETINGS = {
+    "hi", "hello", "hey", "hii", "helo", "heya", "howdy",
+    "good morning", "good afternoon", "good evening", "good night",
+    "namaste", "namaskar", "sup", "what's up", "whats up", "yo"
+}
+
+GREETING_RESPONSES = [
+    "Hello! 🌿 I'm SafeSpace, your AI health companion. I'm here to help with medical questions or emotional support. What's on your mind today?",
+    "Hi there! 🌿 Welcome to SafeSpace. Whether it's a health concern or just need someone to talk to — I'm here. How can I help you today?",
+    "Hey! 🌿 I'm SafeSpace — your personal medical and mental health assistant. What would you like to talk about today?",
+    "Hello! 🌿 Great to hear from you. I can help with medical questions, emotional support, or finding a therapist near you. What do you need today?",
+]
+
+
+def _is_greeting(text: str) -> bool:
+    cleaned = text.lower().strip().rstrip("!?.").strip()
+    return cleaned in GREETINGS or len(cleaned) < 4
+
+
+def _get_greeting_response() -> str:
+    import random
+    return random.choice(GREETING_RESPONSES)
+
+
+def _trim_response(text: str, max_chars: int = 1200) -> str:
+    if len(text) <= max_chars:
+        return text
+    trimmed = text[:max_chars]
+    last_period = max(trimmed.rfind('.'), trimmed.rfind('!'), trimmed.rfind('?'))
+    if last_period > max_chars * 0.7:
+        return trimmed[:last_period + 1]
+    return trimmed + "..."
+
+
+async def run_crew(
+    user_text: str,
+    session: UserSession,
+    user_id: str,
+) -> ChatResponse:
+    """Main crew orchestration function."""
+
+    # ── Fast path: greeting detection ─────────────────────────────────────────
+    if _is_greeting(user_text):
+        logger.info("User %s | Greeting detected — fast path response", user_id)
+        return ChatResponse(
+            text=_get_greeting_response(),
+            intent=Intent.UNKNOWN,
+            escalated=False,
+        )
+
+    # ── Step 1: Classify intent ────────────────────────────────────────────────
+    intent_result = await classify_intent(user_text)
+    logger.info("User %s | Intent: %s (%.2f)", user_id, intent_result.intent, intent_result.confidence)
+
+    # Log to LangSmith
+    from observability.tracer import log_intent
+    log_intent(user_id=user_id, intent=intent_result.intent.value, confidence=intent_result.confidence)
+
+    # ── Step 2: Format conversation history ───────────────────────────────────
+    history = format_history_for_llm(session)
+
+    # ── Step 3: Create agents ─────────────────────────────────────────────────
+    safety_agent = create_safety_agent()
+    doctor_agent = create_doctor_agent()
+    therapist_agent = create_therapist_agent()
+
+    # ── Step 4: Build tasks ────────────────────────────────────────────────────
+    safety_task = Task(
+        description=f"""
+Evaluate this message for safety and crisis risk.
+
+CONVERSATION HISTORY:
+{history}
+
+CURRENT MESSAGE: "{user_text}"
+
+Check for: suicidal ideation, self-harm intent, life-threatening medical emergency.
+- If EMERGENCY detected: use the emergency_call tool, then respond with crisis resources.
+- If NOT emergency: respond with "SAFE: [one sentence about what the user needs]"
+        """,
+        expected_output="Either crisis response with resources, OR 'SAFE: [brief summary]'",
+        agent=safety_agent,
+    )
+
+    doctor_task = Task(
+        description=f"""
+Provide medical guidance for this user. BE CONCISE — maximum 3 short paragraphs.
+
+CONVERSATION HISTORY:
+{history}
+
+CURRENT MESSAGE: "{user_text}"
+
+Safety check result is in your context. The user is not in crisis.
+Follow your guardrails: never diagnose, recommend seeing a doctor for serious concerns.
+
+RESPONSE RULES:
+- Maximum 3 paragraphs, each 2-3 sentences only
+- No repetition between paragraphs
+- End with ONE clear next step
+- Do not repeat the user's symptoms back more than once
+        """,
+        expected_output="Concise 3-paragraph medical guidance with one clear next step.",
+        agent=doctor_agent,
+        context=[safety_task],
+    )
+
+    therapist_task = Task(
+        description=f"""
+Provide mental health support for this user. BE WARM BUT CONCISE — maximum 3 short paragraphs.
+
+CONVERSATION HISTORY:
+{history}
+
+CURRENT MESSAGE: "{user_text}"
+
+Safety check result is in your context. The user is not in crisis.
+
+RESPONSE RULES:
+- Maximum 3 paragraphs, each 2-3 sentences only
+- First paragraph: validate feelings (1-2 sentences only)
+- Second paragraph: one practical coping suggestion OR one follow-up question
+- Third paragraph (optional): offer therapist search if appropriate
+- Do NOT repeat phrases from earlier in the response
+        """,
+        expected_output="Warm, concise 2-3 paragraph support response.",
+        agent=therapist_agent,
+        context=[safety_task],
+    )
+
+    # ── Step 5: Assemble crew ──────────────────────────────────────────────────
+    agents, tasks = _build_crew_for_intent(
+        intent=intent_result.intent,
+        safety_agent=safety_agent,
+        doctor_agent=doctor_agent,
+        therapist_agent=therapist_agent,
+        safety_task=safety_task,
+        doctor_task=doctor_task,
+        therapist_task=therapist_task,
+    )
+
+    crew = Crew(
+        agents=agents,
+        tasks=tasks,
+        process=Process.sequential,
+        verbose=False,
+    )
+
+    # ── Step 6: Run crew ───────────────────────────────────────────────────────
+    try:
+        result = await asyncio.get_event_loop().run_in_executor(
+            None, crew.kickoff
+        )
+        response_text = str(result.raw) if hasattr(result, 'raw') else str(result)
+        response_text = _clean_crew_response(response_text)
+        response_text = _trim_response(response_text)
+    except Exception as e:
+        logger.exception("Crew execution failed for user %s: %s", user_id, e)
+        response_text = (
+            "I'm sorry, I had trouble processing your message. "
+            "Please try again. If this is urgent, call 112."
+        )
+
+    escalated = _detect_escalation(tasks)
+
+    return ChatResponse(
+        text=response_text,
+        intent=intent_result.intent,
+        escalated=escalated,
+    )
+
+
+def _build_crew_for_intent(
+    intent, safety_agent, doctor_agent, therapist_agent,
+    safety_task, doctor_task, therapist_task,
+):
+    if intent == Intent.MEDICAL:
+        return ([safety_agent, doctor_agent], [safety_task, doctor_task])
+    elif intent == Intent.THERAPY:
+        return ([safety_agent, therapist_agent], [safety_task, therapist_task])
+    elif intent == Intent.MIXED:
+        therapist_task.context = [safety_task, doctor_task]
+        return (
+            [safety_agent, doctor_agent, therapist_agent],
+            [safety_task, doctor_task, therapist_task],
+        )
+    else:
+        return ([safety_agent, therapist_agent], [safety_task, therapist_task])
+
+
+def _detect_escalation(tasks) -> bool:
+    try:
+        safety_output = str(tasks[0].output) if tasks[0].output else ""
+        return "EMERGENCY_CALL_PLACED" in safety_output
+    except Exception:
+        return False

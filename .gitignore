@@ -1,0 +1,43 @@
+# ── .gitignore ────────────────────────────────────────────────────────────────
+
+# CRITICAL — never commit secrets
+.env
+.env.local
+.env.production
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Data — don't commit the SQLite DB
+data/
+*.db
+*.sqlite
+
+# Development / test files
+test_quick.py
+toml.txt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# uv
+uv.lock
