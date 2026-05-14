@@ -1,42 +1,85 @@
-# Dockerfile for HF Spaces — Option A: FastAPI + Streamlit combined
+# Dockerfile — SafeSpace AI (FastAPI + Streamlit + Nginx)
 #
 # ARCHITECTURE:
-#   Port 7860 (HF public) → FastAPI (uvicorn)
-#     ├── /whatsapp/webhook  → Twilio WhatsApp handler
-#     ├── /health            → health check
-#     └── /*                 → reverse proxy → Streamlit on port 8501
+#   Nginx on port 7860 (HF public port) routes by URL path:
+#     /whatsapp/*  → FastAPI on 8000 (Twilio webhook)
+#     /health      → FastAPI on 8000
+#     /*           → Streamlit on 8501 (Web UI)
 #
-# Streamlit runs internally on 8501, started as a subprocess by hf_app.py.
-# Only port 7860 is exposed to the internet.
+# This solves the WebSocket 403 problem because Nginx properly
+# proxies WebSocket connections unlike FastAPI's reverse proxy.
 
 FROM python:3.11-slim
 
 WORKDIR /app
 
-# System deps
+# Install system deps including nginx
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc g++ curl \
+    gcc g++ curl nginx \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy everything first (fixes "requirements.txt not found" in Docker build)
+# Copy and install Python deps
 COPY . .
-
-# Install Python dependencies
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Create data dir for SQLite
+# Create data dir
 RUN mkdir -p /app/data
 
-# HF runs containers as uid 1000
-RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+# Write nginx config
+RUN cat > /etc/nginx/nginx.conf << 'NGINXEOF'
+worker_processes 1;
+events { worker_connections 1024; }
+
+http {
+    # Route /whatsapp and /health to FastAPI
+    # Route everything else (including WebSocket) to Streamlit
+    
+    server {
+        listen 7860;
+        
+        # WhatsApp webhook → FastAPI
+        location /whatsapp/ {
+            proxy_pass http://127.0.0.1:8000/whatsapp/;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+        }
+        
+        # Health check → FastAPI
+        location /health {
+            proxy_pass http://127.0.0.1:8000/health;
+            proxy_set_header Host $host;
+        }
+        
+        # Everything else → Streamlit (including WebSocket)
+        location / {
+            proxy_pass http://127.0.0.1:8501/;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            
+            # Critical: proper WebSocket proxying
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection "upgrade";
+            proxy_read_timeout 86400;
+        }
+    }
+}
+NGINXEOF
+
+# HF runs as uid 1000
+RUN useradd -m -u 1000 appuser && \
+    chown -R appuser:appuser /app && \
+    chown -R appuser:appuser /var/log/nginx && \
+    chown -R appuser:appuser /var/lib/nginx && \
+    chown -R appuser:appuser /etc/nginx && \
+    mkdir -p /tmp/nginx && chown appuser:appuser /tmp/nginx
+
 USER appuser
 
-# HF Docker Spaces require port 7860
 EXPOSE 7860
 
 HEALTHCHECK --interval=30s --timeout=15s --start-period=120s --retries=3 \
     CMD curl -f http://localhost:7860/health || exit 1
 
-# hf_app.py starts Streamlit on 8501 then FastAPI on 7860
 CMD ["python", "hf_app.py"]
