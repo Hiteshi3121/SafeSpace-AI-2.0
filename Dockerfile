@@ -1,17 +1,24 @@
-# Dockerfile for Hugging Face Spaces (Docker SDK)
-# App runs on port 7860 (required by HF)
+# Dockerfile for HF Spaces — Option A: FastAPI + Streamlit combined
+#
+# ARCHITECTURE:
+#   Port 7860 (HF public) → FastAPI (uvicorn)
+#     ├── /whatsapp/webhook  → Twilio WhatsApp handler
+#     ├── /health            → health check
+#     └── /*                 → reverse proxy → Streamlit on port 8501
+#
+# Streamlit runs internally on 8501, started as a subprocess by hf_app.py.
+# Only port 7860 is exposed to the internet.
 
 FROM python:3.11-slim
 
 WORKDIR /app
 
-# System dependencies
+# System deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc g++ curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy ALL files first, then install
-# (avoids "requirements.txt not found" if COPY order is wrong)
+# Copy everything first (fixes "requirements.txt not found" in Docker build)
 COPY . .
 
 # Install Python dependencies
@@ -21,19 +28,15 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # Create data dir for SQLite
 RUN mkdir -p /app/data
 
-# HF runs as uid 1000
+# HF runs containers as uid 1000
 RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
 USER appuser
 
-# Port 7860 required by HF Docker Spaces
+# HF Docker Spaces require port 7860
 EXPOSE 7860
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 \
-    CMD curl -f http://localhost:7860/_stcore/health || exit 1
+HEALTHCHECK --interval=30s --timeout=15s --start-period=120s --retries=3 \
+    CMD curl -f http://localhost:7860/health || exit 1
 
-CMD ["streamlit", "run", "hf_app.py", \
-     "--server.port", "7860", \
-     "--server.address", "0.0.0.0", \
-     "--server.headless", "true", \
-     "--server.fileWatcherType", "none", \
-     "--browser.gatherUsageStats", "false"]
+# hf_app.py starts Streamlit on 8501 then FastAPI on 7860
+CMD ["python", "hf_app.py"]
