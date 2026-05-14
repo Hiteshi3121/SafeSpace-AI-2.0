@@ -10,15 +10,15 @@ pinned: false
 
 # SafeSpace AI 2.0
 
-AI-powered Medical & Mental Health Assistant — Multi-agent · Multimodal · Web Interface
+AI-powered Medical & Mental Health Assistant — Multi-agent · Multimodal
 
-Built with CrewAI, Groq (Llama 3.3 70B), LangSmith tracing, and Google Maps for therapist discovery.
+Built with CrewAI, Groq (Llama 3.3 70B), LangSmith tracing, and Google Maps.
 
 ## Features
 - 🩺 Medical symptom guidance (DoctorAgent)
 - 🧠 Mental health support (TherapistAgent)
 - 🚨 Crisis detection & emergency escalation (SafetyAgent)
-- 📍 Nearby therapist finder (Google Maps Places API)
+- 📍 Nearby therapist finder (Google Maps)
 - 🗣️ Voice & image input support
 - 📊 LangSmith observability tracing
 
