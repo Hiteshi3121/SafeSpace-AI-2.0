@@ -64,7 +64,8 @@ async def _resolve_text(request: ChatRequest) -> str | None:
     # Image — always analyze, include caption as context
     if request.message_type == MessageType.IMAGE and request.image_bytes:
         logger.info("Running vision analysis for user %s", request.user_id)
-        vision_result = await describe_image(request.image_bytes)
+        media_type = request.metadata.get("image_media_type", "image/jpeg")
+        vision_result = await describe_image(request.image_bytes, media_type=media_type)
         # If user also sent a caption, include it
         if request.text and request.text.strip():
             return f"User's message: '{request.text.strip()}'\n\n{vision_result}"

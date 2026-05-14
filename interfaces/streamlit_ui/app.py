@@ -63,11 +63,10 @@ st.markdown("""
     }
     .upload-label { font-size: 0.8rem; color: #5a7a5a; margin-bottom: 0.3rem; }
     #MainMenu {visibility: hidden;} footer {visibility: hidden;} header {visibility: hidden;}
-    /* Sidebar always visible fix */
-    [data-testid="stSidebar"] { min-width: 260px !important; max-width: 320px !important; }
-    [data-testid="stSidebar"] > div:first-child { padding-top: 1rem; }
-    /* Center the main content even in wide layout */
-    .main .block-container { max-width: 750px; margin: 0 auto; padding-top: 1rem; }
+    /* Sidebar always visible */
+    [data-testid="stSidebar"] { min-width: 260px !important; max-width: 300px !important; }
+    /* Keep main content readable in wide layout */
+    .main .block-container { max-width: 800px; margin: 0 auto; padding-top: 1rem; }
     .stButton > button {
         border-radius: 24px; background: #1a2e1a; color: white; border: none;
         padding: 0.5rem 1.5rem; font-family: 'DM Sans', sans-serif; font-weight: 500;
@@ -84,6 +83,10 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 if "pending_input" not in st.session_state:
     st.session_state.pending_input = None
+if "input_key" not in st.session_state:
+    st.session_state.input_key = 0  # Increment to clear text input after send
+if "clear_uploads" not in st.session_state:
+    st.session_state.clear_uploads = 0  # Increment to clear file uploaders after send
 
 # ── Init SQLite DB ────────────────────────────────────────────────────────────
 if "db_initialized" not in st.session_state:
@@ -192,6 +195,7 @@ if st.session_state.pending_input:
                 text=pending.get("text"),
                 audio_bytes=pending.get("audio_bytes"),
                 image_bytes=pending.get("image_bytes"),
+                metadata={"image_media_type": pending.get("image_media_type", "image/jpeg")},
             )
             response: ChatResponse = run_async(handle_request(request))
             response_text = clean_response(response.text)
@@ -239,7 +243,7 @@ with col1:
         label="message",
         placeholder="How are you feeling today?",
         label_visibility="collapsed",
-        key="chat_input",
+        key=f"chat_input_{st.session_state.input_key}",
     )
 with col2:
     send_clicked = st.button("Send", use_container_width=True)
@@ -250,14 +254,14 @@ with col3:
     uploaded_image = st.file_uploader(
         "📷 Upload medical image",
         type=["jpg", "jpeg", "png", "webp"],
-        key="image_upload",
+        key=f"image_upload_{st.session_state.clear_uploads}",
         label_visibility="visible",
     )
 with col4:
     uploaded_audio = st.file_uploader(
         "🎙️ Upload voice note",
         type=["ogg", "mp3", "wav", "m4a", "webm"],
-        key="audio_upload",
+        key=f"audio_upload_{st.session_state.clear_uploads}",
         label_visibility="visible",
     )
 
@@ -272,6 +276,7 @@ if send_clicked and user_input.strip():
         "type": MessageType.TEXT,
         "text": user_text,
     }
+    st.session_state.input_key += 1   # Forces text input to clear on rerun
     st.rerun()
 
 # Image send — use filename as processed key to avoid re-triggering
@@ -280,6 +285,11 @@ if uploaded_image is not None:
     if img_key not in st.session_state:
         st.session_state[img_key] = True
         image_bytes = uploaded_image.read()
+        # Detect media type from file extension for correct base64 encoding
+        ext = uploaded_image.name.rsplit(".", 1)[-1].lower()
+        media_type_map = {"jpg": "image/jpeg", "jpeg": "image/jpeg",
+                          "png": "image/png", "webp": "image/webp"}
+        img_media_type = media_type_map.get(ext, "image/jpeg")
         st.session_state.messages.append({
             "role": "user",
             "content": f"📷 Image uploaded: {uploaded_image.name}",
@@ -287,7 +297,9 @@ if uploaded_image is not None:
         st.session_state.pending_input = {
             "type": MessageType.IMAGE,
             "image_bytes": image_bytes,
+            "image_media_type": img_media_type,
         }
+        st.session_state.clear_uploads += 1  # Forces uploaders to clear
         st.rerun()
 
 # Audio send — same pattern
@@ -305,4 +317,5 @@ if uploaded_audio is not None:
             "audio_bytes": audio_bytes,
             "text": uploaded_audio.name,  # Pass filename for format detection
         }
+        st.session_state.clear_uploads += 1  # Forces uploaders to clear
         st.rerun()
