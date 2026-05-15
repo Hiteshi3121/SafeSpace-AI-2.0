@@ -6,7 +6,6 @@ HOW TO RUN:
 """
 
 import asyncio
-import base64
 import concurrent.futures
 import sys
 import uuid
@@ -111,10 +110,7 @@ st.markdown("""
     [data-testid="stFileUploader"] label { color: #3a6a3a !important; font-size: 0.72rem !important; font-weight: 600 !important; letter-spacing: 0.06em !important; text-transform: uppercase !important; }
     [data-testid="stFileUploaderDropzoneInstructions"] { font-size: 0.7rem !important; color: #253525 !important; }
 
-    /* Hide mic receiver */
-    [data-testid="stTextInput"]:has(input[aria-label="mic_audio_receiver"]) {
-        height: 0 !important; overflow: hidden !important; margin: 0 !important; padding: 0 !important; opacity: 0 !important;
-    }
+    /* mic receiver removed — using st.audio_input instead */
 
     /* Scrollbar */
     ::-webkit-scrollbar { width: 3px; }
@@ -133,8 +129,6 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 if "pending_input" not in st.session_state:
     st.session_state.pending_input = None
-if "mic_audio_b64" not in st.session_state:
-    st.session_state.mic_audio_b64 = None
 
 # ── Init SQLite DB ────────────────────────────────────────────────────────────
 if "db_initialized" not in st.session_state:
@@ -287,107 +281,17 @@ st.markdown('<hr class="input-divider">', unsafe_allow_html=True)
 # Layout matches user sketch: [🎙 Speak] [☁️ Upload Audio] [📷 Upload Image]
 mic_col, audio_col, image_col = st.columns([1, 1, 1])
 
-# 🎙 SPEAK — live browser mic recorder
+# 🎙 SPEAK — native Streamlit mic (works in all browsers, no JS needed)
 with mic_col:
-    # JavaScript mic recorder using st.components
-    # Uses streamlit's native query_params trick won't work in HF iframe.
-    # Instead we use a hidden text_input that JS writes to via DOM,
-    # and Streamlit reads it on next rerun.
-    mic_html = """
-<style>
-  .mic-wrap { text-align: center; }
-  .mic-btn {
-    width: 100%; padding: 8px 0; border-radius: 8px; border: none;
-    cursor: pointer; font-size: 13px; font-weight: 600;
-    transition: all 0.2s; display: block;
-  }
-  #micStart { background: #1a2e1a; color: #f0f7f0; }
-  #micStart:hover { background: #2d4f2d; }
-  #micStop  { background: #c0392b; color: white; display: none; }
-  #micStop:hover  { background: #e74c3c; }
-  #micStatus { font-size: 11px; color: #888; text-align:center;
-               margin-top: 4px; min-height: 16px; }
-  .rec-dot  { display:inline-block; width:7px; height:7px; background:red;
-              border-radius:50%; margin-right:3px;
-              animation: blink 1s infinite; }
-  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
-</style>
-<div class="mic-wrap">
-  <button class="mic-btn" id="micStart" onclick="startRec()">🎙️ Speak</button>
-  <button class="mic-btn" id="micStop"  onclick="stopRec()">⏹️ Stop</button>
-  <div id="micStatus">Click to record</div>
-</div>
-<script>
-let recorder, chunks = [], stream;
-
-async function startRec() {
-  try {
-    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    recorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
-    chunks = [];
-    recorder.ondataavailable = e => { if(e.data.size > 0) chunks.push(e.data); };
-    recorder.onstop = encodeAndSend;
-    recorder.start(100);
-    document.getElementById('micStart').style.display = 'none';
-    document.getElementById('micStop').style.display  = 'block';
-    document.getElementById('micStatus').innerHTML =
-      '<span class="rec-dot"></span>Recording...';
-  } catch(err) {
-    document.getElementById('micStatus').textContent =
-      '❌ Allow mic in browser settings';
-  }
-}
-
-function stopRec() {
-  if (recorder && recorder.state !== 'inactive') {
-    recorder.stop();
-    stream.getTracks().forEach(t => t.stop());
-    document.getElementById('micStop').style.display  = 'none';
-    document.getElementById('micStart').style.display = 'block';
-    document.getElementById('micStatus').textContent  = 'Processing...';
-  }
-}
-
-function encodeAndSend() {
-  const blob = new Blob(chunks, { type: 'audio/webm' });
-  const reader = new FileReader();
-  reader.onloadend = () => {
-    const b64 = reader.result.split(',')[1];
-    // Write to the hidden Streamlit text input so Python can read it
-    const inputs = window.parent.document.querySelectorAll('input[type=text]');
-    for (let inp of inputs) {
-      if (inp.getAttribute('aria-label') === 'mic_audio_receiver') {
-        inp.value = b64;
-        inp.dispatchEvent(new Event('input', { bubbles: true }));
-        document.getElementById('micStatus').textContent = 'Sent ✅';
-        break;
-      }
-    }
-  };
-  reader.readAsDataURL(blob);
-}
-</script>
-"""
-    st.components.v1.html(mic_html, height=75)
-    # Hidden receiver using CSS to make it invisible
-    # JS targets this input by its data-testid and writes base64 audio
-    mic_receiver = st.text_input(
-        "mic_audio_receiver",
-        key="mic_audio_receiver",
-        label_visibility="collapsed",
+    audio_input = st.audio_input(
+        "🎙️ Speak",
+        key="mic_recorder",
     )
-    # Hide with CSS targeting the specific key
-    st.markdown("""
-    <style>
-    [data-testid="stTextInput"]:has(input[aria-label="mic_audio_receiver"]) {
-        height: 0 !important; overflow: hidden !important;
-        margin: 0 !important; padding: 0 !important; opacity: 0 !important;
-    }
-    </style>""", unsafe_allow_html=True)
-    if mic_receiver and mic_receiver != st.session_state.get("last_mic_val", ""):
-        st.session_state.last_mic_val = mic_receiver
-        try:
-            audio_bytes = base64.b64decode(mic_receiver)
+    if audio_input is not None:
+        mic_key = f"mic_{audio_input.name}_{audio_input.size}"
+        if mic_key not in st.session_state:
+            st.session_state[mic_key] = True
+            audio_bytes = audio_input.read()
             st.session_state.messages.append({
                 "role": "user",
                 "content": "🎙️ Voice message recorded",
@@ -395,11 +299,9 @@ function encodeAndSend() {
             st.session_state.pending_input = {
                 "type": MessageType.AUDIO,
                 "audio_bytes": audio_bytes,
-                "text": "recorded.webm",
+                "text": "recorded.wav",
             }
             st.rerun()
-        except Exception as e:
-            st.caption(f"Audio error: {e}")
 
 # ☁️ UPLOAD AUDIO
 with audio_col:
