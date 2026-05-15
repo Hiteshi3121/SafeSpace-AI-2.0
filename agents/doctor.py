@@ -28,7 +28,6 @@ shapes every response. Key guardrails we've baked in:
 
 from crewai import Agent
 from core.config import get_settings
-from tools.maps_tool import find_doctors_tool
 
 settings = get_settings()
 
@@ -78,10 +77,10 @@ def create_doctor_agent() -> Agent:
         role=DOCTOR_ROLE,
         goal=DOCTOR_GOAL,
         backstory=DOCTOR_BACKSTORY,
-        tools=[find_doctors_tool],
+        tools=[],                           # Doctor uses no external tools
         llm="groq/llama-3.3-70b-versatile",
         verbose=settings.is_development,
         allow_delegation=False,
-        max_iter=5,  # Needs steps to: think → call tool → get results → respond
+        max_iter=2,                         # Medical responses shouldn't need many iterations
         memory=False,                       # We manage memory via SQLite
     )
