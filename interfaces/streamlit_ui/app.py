@@ -6,6 +6,7 @@ HOW TO RUN:
 """
 
 import asyncio
+import base64
 import concurrent.futures
 import sys
 import uuid
@@ -63,13 +64,6 @@ st.markdown("""
     }
     .upload-label { font-size: 0.8rem; color: #5a7a5a; margin-bottom: 0.3rem; }
     #MainMenu {visibility: hidden;} footer {visibility: hidden;} header {visibility: hidden;}
-    /* Sidebar fixes */
-    [data-testid="stSidebar"] { min-width: 250px !important; }
-    [data-testid="stSidebar"] > div:first-child { padding-top: 1.5rem; }
-    /* Main chat area */
-    .main .block-container { padding-top: 1rem; padding-bottom: 2rem; }
-    /* Make chat messages full width in centered layout */
-    .stChatMessage { max-width: 100% !important; }
     .stButton > button {
         border-radius: 24px; background: #1a2e1a; color: white; border: none;
         padding: 0.5rem 1.5rem; font-family: 'DM Sans', sans-serif; font-weight: 500;
@@ -86,10 +80,6 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 if "pending_input" not in st.session_state:
     st.session_state.pending_input = None
-if "input_key" not in st.session_state:
-    st.session_state.input_key = 0  # Increment to clear text input after send
-if "clear_uploads" not in st.session_state:
-    st.session_state.clear_uploads = 0  # Increment to clear file uploaders after send
 
 # ── Init SQLite DB ────────────────────────────────────────────────────────────
 if "db_initialized" not in st.session_state:
@@ -198,7 +188,6 @@ if st.session_state.pending_input:
                 text=pending.get("text"),
                 audio_bytes=pending.get("audio_bytes"),
                 image_bytes=pending.get("image_bytes"),
-                metadata={"image_media_type": pending.get("image_media_type", "image/jpeg")},
             )
             response: ChatResponse = run_async(handle_request(request))
             response_text = clean_response(response.text)
@@ -246,7 +235,7 @@ with col1:
         label="message",
         placeholder="How are you feeling today?",
         label_visibility="collapsed",
-        key=f"chat_input_{st.session_state.input_key}",
+        key="chat_input",
     )
 with col2:
     send_clicked = st.button("Send", use_container_width=True)
@@ -257,14 +246,119 @@ with col3:
     uploaded_image = st.file_uploader(
         "📷 Upload medical image",
         type=["jpg", "jpeg", "png", "webp"],
-        key=f"image_upload_{st.session_state.clear_uploads}",
+        key="image_upload",
         label_visibility="visible",
     )
 with col4:
+    st.markdown("🎙️ **Live voice message**")
+
+    # ── Browser microphone recorder ───────────────────────────────────────────
+    # Records audio directly in the browser using MediaRecorder API.
+    # When user clicks Stop, audio is base64-encoded and sent via
+    # Streamlit's component communication (query params trick).
+    mic_html = """
+<style>
+  .mic-btn {
+    padding: 8px 18px; border-radius: 20px; border: none;
+    cursor: pointer; font-size: 14px; font-weight: 500;
+    transition: all 0.2s;
+  }
+  #startBtn { background: #1a2e1a; color: #f0f7f0; }
+  #startBtn:hover { background: #2d4f2d; }
+  #stopBtn  { background: #c0392b; color: white; display:none; }
+  #stopBtn:hover  { background: #e74c3c; }
+  #micStatus { font-size: 12px; color: #666; margin-top: 6px; min-height: 18px; }
+  .rec-dot { display:inline-block; width:8px; height:8px; background:red;
+             border-radius:50%; margin-right:4px; animation: blink 1s infinite; }
+  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
+</style>
+
+<button class="mic-btn" id="startBtn" onclick="startRec()">🎙️ Hold to Record</button>
+<button class="mic-btn" id="stopBtn"  onclick="stopRec()">⏹️ Stop & Send</button>
+<div id="micStatus">Click to start recording</div>
+
+<script>
+let recorder, chunks = [], stream;
+
+async function startRec() {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    recorder = new MediaRecorder(stream);
+    chunks = [];
+    recorder.ondataavailable = e => chunks.push(e.data);
+    recorder.onstop = sendAudio;
+    recorder.start();
+    document.getElementById('startBtn').style.display = 'none';
+    document.getElementById('stopBtn').style.display  = 'inline-block';
+    document.getElementById('micStatus').innerHTML =
+      '<span class="rec-dot"></span> Recording... click Stop when done';
+  } catch(e) {
+    document.getElementById('micStatus').textContent =
+      'Mic access denied. Allow microphone in browser settings.';
+  }
+}
+
+function stopRec() {
+  if (recorder && recorder.state !== 'inactive') {
+    recorder.stop();
+    stream.getTracks().forEach(t => t.stop());
+    document.getElementById('stopBtn').style.display  = 'none';
+    document.getElementById('startBtn').style.display = 'inline-block';
+    document.getElementById('micStatus').textContent  = 'Processing...';
+  }
+}
+
+function sendAudio() {
+  const blob = new Blob(chunks, { type: 'audio/webm' });
+  const reader = new FileReader();
+  reader.onloadend = () => {
+    // base64 string without the data:audio/webm;base64, prefix
+    const b64 = reader.result.split(',')[1];
+    // Send to Streamlit via URL hash (Streamlit reads window.location)
+    const url = new URL(window.location.href);
+    url.searchParams.set('audio_b64', b64);
+    // Use parent frame if inside iframe (HF Spaces embeds in iframe)
+    const target = window.parent !== window ? window.parent : window;
+    target.location.href = url.toString();
+  };
+  reader.readAsDataURL(blob);
+  document.getElementById('micStatus').textContent = 'Sending...';
+}
+</script>
+"""
+    st.components.v1.html(mic_html, height=90)
+
+    # Check if audio was sent via URL params
+    uploaded_audio = None  # keep variable name for compatibility below
+    try:
+        params = st.query_params
+        audio_b64 = params.get("audio_b64", None)
+        if audio_b64 and "mic_audio_processed" not in st.session_state:
+            st.session_state.mic_audio_processed = True
+            audio_bytes = base64.b64decode(audio_b64)
+            st.session_state.messages.append({
+                "role": "user",
+                "content": "🎙️ Voice message recorded",
+            })
+            st.session_state.pending_input = {
+                "type": MessageType.AUDIO,
+                "audio_bytes": audio_bytes,
+                "text": "recorded.webm",
+            }
+            # Clear the param so it doesn't re-trigger on rerun
+            st.query_params.clear()
+            st.rerun()
+        elif not audio_b64:
+            # Reset processed flag when no audio in params
+            st.session_state.pop("mic_audio_processed", None)
+    except Exception as e:
+        st.caption(f"Mic error: {e}")
+
+    # Also keep file uploader as fallback
     uploaded_audio = st.file_uploader(
-        "🎙️ Upload voice note",
+        "Or upload audio file",
         type=["ogg", "mp3", "wav", "m4a", "webm"],
-        key=f"audio_upload_{st.session_state.clear_uploads}",
+        key="audio_upload",
         label_visibility="visible",
     )
 
@@ -279,7 +373,6 @@ if send_clicked and user_input.strip():
         "type": MessageType.TEXT,
         "text": user_text,
     }
-    st.session_state.input_key += 1   # Forces text input to clear on rerun
     st.rerun()
 
 # Image send — use filename as processed key to avoid re-triggering
@@ -288,11 +381,6 @@ if uploaded_image is not None:
     if img_key not in st.session_state:
         st.session_state[img_key] = True
         image_bytes = uploaded_image.read()
-        # Detect media type from file extension for correct base64 encoding
-        ext = uploaded_image.name.rsplit(".", 1)[-1].lower()
-        media_type_map = {"jpg": "image/jpeg", "jpeg": "image/jpeg",
-                          "png": "image/png", "webp": "image/webp"}
-        img_media_type = media_type_map.get(ext, "image/jpeg")
         st.session_state.messages.append({
             "role": "user",
             "content": f"📷 Image uploaded: {uploaded_image.name}",
@@ -300,9 +388,7 @@ if uploaded_image is not None:
         st.session_state.pending_input = {
             "type": MessageType.IMAGE,
             "image_bytes": image_bytes,
-            "image_media_type": img_media_type,
         }
-        st.session_state.clear_uploads += 1  # Forces uploaders to clear
         st.rerun()
 
 # Audio send — same pattern
@@ -320,5 +406,4 @@ if uploaded_audio is not None:
             "audio_bytes": audio_bytes,
             "text": uploaded_audio.name,  # Pass filename for format detection
         }
-        st.session_state.clear_uploads += 1  # Forces uploaders to clear
         st.rerun()
