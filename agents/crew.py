@@ -71,11 +71,15 @@ def _trim_response(text: str, max_chars: int = 1200) -> str:
 
 def _detect_location_followup(user_text: str, session) -> str | None:
     """
-    Detects when user replies with a city after AI asked
-    "Would you like me to find a therapist near you? Reply with your city."
+    Detects when user replies with a location after AI asked for their city.
+    Uses LLM to extract the city name from any phrasing.
 
-    Bypasses intent classification entirely and directly calls the maps tool.
-    Returns formatted results string, or None if not a location follow-up.
+    Examples it handles:
+      "yes, nagpur"
+      "nagpur"
+      "yes tell me therapist in wadi nagpur"  → extracts "wadi, nagpur"
+      "moosapet hyderabad"
+      "I am in Banjara Hills, Hyderabad"      → extracts "Banjara Hills, Hyderabad"
     """
     if not session or not session.messages:
         return None
@@ -88,42 +92,88 @@ def _detect_location_followup(user_text: str, session) -> str | None:
     if not last_ai:
         return None
 
-    # Did the AI ask for a city?
+    # Did the AI ask for a city in any phrasing?
     asked_for_city = any(phrase in last_ai.lower() for phrase in [
         "reply with your city",
         "reply with your city name",
         "tell me your city",
         "what city are you in",
+        "your city name",
+        "city name",
     ])
     if not asked_for_city:
         return None
 
-    # Is user's reply a city (not a new question)?
+    # User said no — don't search
     user_lower = user_text.lower().strip()
-    skip_if_starts = ["what", "how", "why", "tell me", "i want", "i need",
-                      "can you", "please", "i feel", "i have", "i am not"]
-    if any(user_lower.startswith(p) for p in skip_if_starts):
-        return None
-
-    # User said no
-    if user_lower in ["no", "nope", "na", "nahi", "not now", "no thanks"]:
+    if user_lower in ["no", "nope", "na", "nahi", "not now", "no thanks", "skip"]:
         return "No problem! Let me know if you need anything else. 🌿"
 
-    # Extract location — strip "yes," prefix variations
-    location = user_lower
-    for prefix in ["yes,", "yes ", "sure,", "sure ", "ok,", "ok ", "haan,", "haan "]:
-        if location.startswith(prefix):
-            location = location[len(prefix):].strip()
+    # Use LLM to extract the city/location from whatever the user typed
+    # This handles: "yes nagpur", "wadi nagpur", "I am in Banjara Hills Hyderabad", etc.
+    location = _extract_location_with_llm(user_text)
 
-    if not location or len(location) < 2:
+    if not location:
         return None
 
-    location = location.title()
-
-    # Call therapist finder directly — no LLM needed
+    # Call therapist finder directly
     from tools.maps_tool import find_therapists_tool
-    logger.info("Location follow-up detected: searching therapists near '%s'", location)
+    logger.info("Location follow-up: searching therapists near '%s'", location)
     return find_therapists_tool._run(location=location)
+
+
+def _extract_location_with_llm(user_text: str) -> str | None:
+    """
+    Uses LLM to extract just the location/city name from user message.
+    Returns the location string, or None if no location found.
+    """
+    from groq import Groq
+    from core.config import get_settings
+    settings = get_settings()
+
+    try:
+        client = Groq(api_key=settings.groq_api_key)
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Extract only the city or location name from the user message. "
+                        "Reply with ONLY the location name — nothing else. "
+                        "Examples: "
+                        "'yes nagpur' → 'Nagpur' | "
+                        "'find therapist in wadi nagpur' → 'Wadi, Nagpur' | "
+                        "'I am in Banjara Hills Hyderabad' → 'Banjara Hills, Hyderabad' | "
+                        "'moosapet hyderabad' → 'Moosapet, Hyderabad' | "
+                        "'no' → 'NONE' | "
+                        "'I don't know' → 'NONE'. "
+                        "If no location present, reply NONE."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": user_text
+                }
+            ],
+            max_tokens=15,
+            temperature=0.0,
+        )
+        result = response.choices[0].message.content.strip()
+        logger.info("LLM extracted location: '%s' from '%s'", result, user_text)
+
+        if result.upper() == "NONE" or not result:
+            return None
+        return result
+
+    except Exception as e:
+        logger.warning("LLM location extraction failed: %s", e)
+        # Fallback: simple strip of common prefixes
+        loc = user_text.lower().strip()
+        for prefix in ["yes,", "yes ", "sure,", "sure ", "ok ", "find ", "search "]:
+            if loc.startswith(prefix):
+                loc = loc[len(prefix):].strip()
+        return loc.title() if len(loc) > 2 else None
 
 
 
