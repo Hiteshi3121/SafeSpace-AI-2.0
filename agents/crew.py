@@ -68,6 +68,65 @@ def _trim_response(text: str, max_chars: int = 1200) -> str:
     return trimmed + "..."
 
 
+
+def _detect_location_followup(user_text: str, session) -> str | None:
+    """
+    Detects when user replies with a city after AI asked
+    "Would you like me to find a therapist near you? Reply with your city."
+
+    Bypasses intent classification entirely and directly calls the maps tool.
+    Returns formatted results string, or None if not a location follow-up.
+    """
+    if not session or not session.messages:
+        return None
+
+    # Find last AI message
+    last_ai = next(
+        (m.content for m in reversed(session.messages) if m.role == "assistant"),
+        None
+    )
+    if not last_ai:
+        return None
+
+    # Did the AI ask for a city?
+    asked_for_city = any(phrase in last_ai.lower() for phrase in [
+        "reply with your city",
+        "reply with your city name",
+        "tell me your city",
+        "what city are you in",
+    ])
+    if not asked_for_city:
+        return None
+
+    # Is user's reply a city (not a new question)?
+    user_lower = user_text.lower().strip()
+    skip_if_starts = ["what", "how", "why", "tell me", "i want", "i need",
+                      "can you", "please", "i feel", "i have", "i am not"]
+    if any(user_lower.startswith(p) for p in skip_if_starts):
+        return None
+
+    # User said no
+    if user_lower in ["no", "nope", "na", "nahi", "not now", "no thanks"]:
+        return "No problem! Let me know if you need anything else. 🌿"
+
+    # Extract location — strip "yes," prefix variations
+    location = user_lower
+    for prefix in ["yes,", "yes ", "sure,", "sure ", "ok,", "ok ", "haan,", "haan "]:
+        if location.startswith(prefix):
+            location = location[len(prefix):].strip()
+
+    if not location or len(location) < 2:
+        return None
+
+    location = location.title()
+
+    # Call therapist finder directly — no LLM needed
+    from tools.maps_tool import find_therapists_tool
+    logger.info("Location follow-up detected: searching therapists near '%s'", location)
+    return find_therapists_tool._run(location=location)
+
+
+
 async def run_crew(
     user_text: str,
     session: UserSession,
@@ -85,6 +144,15 @@ async def run_crew(
         )
 
     # ── Step 1: Classify intent ────────────────────────────────────────────────
+    # ── Location follow-up: bypass crew if user replied with a city ──────────
+    location_response = _detect_location_followup(user_text, session)
+    if location_response:
+        return ChatResponse(
+            text=location_response,
+            intent=Intent.THERAPY,
+            escalated=False,
+        )
+
     intent_result = await classify_intent(user_text)
     logger.info("User %s | Intent: %s (%.2f)", user_id, intent_result.intent, intent_result.confidence)
 
