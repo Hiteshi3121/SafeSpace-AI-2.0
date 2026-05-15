@@ -225,7 +225,6 @@ def _call_mcp_server(mcp_url: str, location: str, specialty: str) -> str:
 
 
 # Singleton instance — imported directly by TherapistAgent
-find_therapists_tool = FindTherapistsTool()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
