@@ -129,6 +129,8 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 if "pending_input" not in st.session_state:
     st.session_state.pending_input = None
+if "input_key" not in st.session_state:
+    st.session_state.input_key = 0
 
 # ── Init SQLite DB ────────────────────────────────────────────────────────────
 if "db_initialized" not in st.session_state:
@@ -328,7 +330,7 @@ with col1:
         label="message",
         placeholder="Type your message...",
         label_visibility="collapsed",
-        key="chat_input",
+        key=f"chat_input_{st.session_state.input_key}",
     )
 with col2:
     send_clicked = st.button("➤", use_container_width=True)
@@ -344,6 +346,7 @@ if send_clicked and user_input.strip():
         "type": MessageType.TEXT,
         "text": user_text,
     }
+    st.session_state.input_key += 1  # clears the text input on rerun
     st.rerun()
 
 # Image send — use filename as processed key to avoid re-triggering
