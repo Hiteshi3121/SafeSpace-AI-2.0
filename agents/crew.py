@@ -5,7 +5,6 @@ The CrewAI crew — wires all agents + tasks together.
 
 import asyncio
 import logging
-import os
 import re
 from crewai import Crew, Task, Process
 
@@ -14,14 +13,7 @@ from agents.safety import create_safety_agent
 from agents.doctor import create_doctor_agent
 from agents.therapist import create_therapist_agent
 from core.schemas import ChatResponse, Intent, UserSession
-from core.config import get_settings
 from memory.store import format_history_for_llm
-
-# ── Inject API key into environment so CrewAI/LiteLLM can find it ────────────
-# CrewAI reads os.environ directly — it does NOT use the settings object.
-# Without this line the crew throws "Invalid API Key" even when .env is loaded.
-_settings = get_settings()
-os.environ.setdefault("GROQ_API_KEY", _settings.groq_api_key)
 
 logger = logging.getLogger(__name__)
 
@@ -128,7 +120,7 @@ Check for: suicidal ideation, self-harm intent, life-threatening medical emergen
 
     doctor_task = Task(
         description=f"""
-Provide medical guidance for this user. BE CONCISE — maximum 3 short paragraphs.
+Provide medical guidance for this user.
 
 CONVERSATION HISTORY:
 {history}
@@ -138,20 +130,29 @@ CURRENT MESSAGE: "{user_text}"
 Safety check result is in your context. The user is not in crisis.
 Follow your guardrails: never diagnose, recommend seeing a doctor for serious concerns.
 
-RESPONSE RULES:
-- Maximum 3 paragraphs, each 2-3 sentences only
-- No repetition between paragraphs
-- End with ONE clear next step
-- Do not repeat the user's symptoms back more than once
+RESPONSE STRUCTURE (strictly follow this):
+- Paragraph 1 (80% of response): Medical information — possible causes, what it means,
+  practical home care steps, warning signs to watch for, when to see a doctor.
+  Be specific and useful. This is the MAIN part.
+- Paragraph 2 (10% of response): One brief empathetic sentence only. No more.
+- Paragraph 3 (10% of response): Ask if they want nearby doctors/specialists.
+  Say: "Would you like me to find nearby doctors or specialists for this?
+  If yes, reply with your city name."
+
+RULES:
+- Maximum 3 paragraphs total
+- No repeating the user's symptoms
+- No filler phrases like "I understand" or "That must be difficult" taking up space
+- The medical content must be specific to their symptoms, not generic
         """,
-        expected_output="Concise 3-paragraph medical guidance with one clear next step.",
+        expected_output="Medical guidance: 80% medical info, 10% empathy, 10% doctor search offer.",
         agent=doctor_agent,
         context=[safety_task],
     )
 
     therapist_task = Task(
         description=f"""
-Provide mental health support for this user. BE WARM BUT CONCISE — maximum 3 short paragraphs.
+Provide mental health support for this user.
 
 CONVERSATION HISTORY:
 {history}
@@ -160,14 +161,21 @@ CURRENT MESSAGE: "{user_text}"
 
 Safety check result is in your context. The user is not in crisis.
 
-RESPONSE RULES:
-- Maximum 3 paragraphs, each 2-3 sentences only
-- First paragraph: validate feelings (1-2 sentences only)
-- Second paragraph: one practical coping suggestion OR one follow-up question
-- Third paragraph (optional): offer therapist search if appropriate
-- Do NOT repeat phrases from earlier in the response
+RESPONSE STRUCTURE (strictly follow this):
+- Paragraph 1 (10% of response): One sentence validating their feeling. Keep it brief.
+- Paragraph 2 (80% of response): Practical help — specific coping technique, CBT reframing,
+  breathing exercise, actionable step, or ONE focused follow-up question.
+  This is the MAIN part. Be specific and useful, not generic.
+- Paragraph 3 (10% of response): Offer therapist search.
+  Say: "Would you like me to find a therapist near you? If yes, reply with your city."
+
+RULES:
+- Maximum 3 paragraphs total
+- Do NOT use more than one sentence for validation — warmth should be in the advice, not preamble
+- Do NOT repeat the user's words back to them
+- Do NOT offer multiple suggestions — pick ONE best one
         """,
-        expected_output="Warm, concise 2-3 paragraph support response.",
+        expected_output="Support response: 10% validation, 80% practical help, 10% therapist search offer.",
         agent=therapist_agent,
         context=[safety_task],
     )

@@ -1,36 +1,33 @@
 """
 tools/maps_tool.py
 
-Finds nearby therapists/psychiatrists using Google Maps Places API.
+CrewAI Tool that finds nearby therapists/psychiatrists.
 
-WHY GOOGLE MAPS (not Overpass/OpenStreetMap):
-=============================================
-OpenStreetMap has almost no mental health clinic data for Indian cities.
-Overpass queries return 0 results for Nagpur, Mumbai, Pune etc.
-Google Maps has real, verified clinic listings for India — it's the
-right tool for this use case.
+DATA SOURCE — OpenStreetMap via Overpass API (FREE, no API key needed)
+======================================================================
+We replaced Google Maps Places API with the Overpass API which queries
+OpenStreetMap data. 100% free, no billing, no API key required.
 
-SETUP (one-time, 5 minutes):
-=============================
-1. Go to: console.cloud.google.com
-2. Select your project (or create one)
-3. APIs & Services → Library → search "Places API" → Enable it
-   ⚠️  You need "Places API" — NOT "Maps JavaScript API"
-4. APIs & Services → Credentials → copy your API key
-5. Add to .env:  GOOGLE_MAPS_API_KEY=your_key_here
+HOW IT WORKS (2 steps):
+  1. Geocode the city name → lat/lon using Nominatim (OSM's free geocoder)
+     e.g. "Nagpur" → (21.1458, 79.0882)
 
-FREE TIER:
-  Google gives $200 free credit/month.
-  Places Text Search costs $0.032/call → you get ~6,000 free searches/month.
-  No charges unless you exceed $200/month.
-  Add billing to activate the free credit:
-  console.cloud.google.com → Billing → Link a billing account
+  2. Query Overpass for healthcare nodes within 5km radius:
+     - amenity=doctors with healthcare:speciality=psychiatry/psychology
+     - healthcare=psychotherapist
+     - amenity=clinic (general mental health clinics)
+
+WHY THIS IS STILL A CrewAI TOOL (not hardcoded):
+==================================================
+The TherapistAgent's LLM brain decides WHEN to call this tool.
+It reasons: "User wants a therapist near Nagpur → call find_nearby_therapists"
+We just changed the underlying data source — the agent behavior is identical.
 
 MCP BRIDGE:
 ===========
-When THERAPIST_MCP_URL is set in .env and the MCP server is running,
-this tool routes through the MCP server instead of calling Google Maps directly.
-Leave THERAPIST_MCP_URL empty to call Google Maps directly (simpler for local dev).
+When the MCP server (mcp_server/therapist_directory.py) is running,
+this tool calls it via HTTP instead of Overpass directly.
+Same CrewAI tool interface, swappable backend.
 """
 
 import logging
@@ -42,11 +39,17 @@ from core.config import get_settings
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
-PLACES_TEXT_SEARCH_URL = "https://maps.googleapis.com/maps/api/place/textsearch/json"
-PLACES_DETAILS_URL     = "https://maps.googleapis.com/maps/api/place/details/json"
+# Nominatim geocoder — free OSM service, requires a User-Agent header
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+OVERPASS_URL  = "https://overpass-api.de/api/interpreter"
+HEADERS       = {"User-Agent": "SafeSpace-AI/2.0 (mental health assistant)"}
+
+# Radius in metres to search around the geocoded location
+SEARCH_RADIUS_M = 5000
 
 
 class TherapistSearchInput(BaseModel):
+    """Input schema for the therapist finder tool."""
     location: str = Field(
         ...,
         description="City or area to search in, e.g. 'Nagpur', 'Mumbai Maharashtra'"
@@ -59,137 +62,146 @@ class TherapistSearchInput(BaseModel):
 
 class FindTherapistsTool(BaseTool):
     """
-    Finds nearby therapists, psychiatrists, and counselors using Google Maps.
+    Finds nearby therapists, psychiatrists, and counselors using
+    OpenStreetMap (Overpass API) — completely free, no API key needed.
     Use this when the user asks for professional mental health support,
-    therapy recommendations, or mentions a city and wants a therapist there.
+    therapy recommendations, or help finding a doctor near them.
     """
     name: str = "find_nearby_therapists"
     description: str = (
-        "Searches Google Maps for nearby therapists, psychiatrists, and counselors. "
+        "Searches OpenStreetMap for nearby therapists, psychiatrists, and counselors. "
         "Use when the user explicitly asks for professional help, therapy recommendations, "
-        "or mentions a specific location/city and wants a therapist there. "
-        "Input: location (city/area name) and optional specialty type."
+        "or when you determine they need in-person professional support. "
+        "Input: location (city/area) and optional specialty type."
     )
     args_schema: type[BaseModel] = TherapistSearchInput
 
     def _run(self, location: str, specialty: str = "therapist psychiatrist counselor") -> str:
+        """
+        Two-step search:
+          1. Geocode location name → coordinates via Nominatim
+          2. Query Overpass for mental health professionals nearby
+        Falls back to MCP server if THERAPIST_MCP_URL is configured.
+        """
 
-        # ── Route through MCP server if configured ─────────────────────────
+        # ── MCP bridge: if MCP server is running, delegate to it ──────────────
         mcp_url = getattr(settings, "therapist_mcp_url", "")
         if mcp_url:
-            result = _try_mcp(mcp_url, location, specialty)
-            if result:
-                return result
-            # MCP unreachable — fall through to Google Maps directly
+            return _call_mcp_server(mcp_url, location, specialty)
 
-        # ── Google Maps Places API ─────────────────────────────────────────
-        api_key = getattr(settings, "google_maps_api_key", "")
-        if not api_key:
-            logger.warning("GOOGLE_MAPS_API_KEY not set in .env")
-            return _no_api_fallback(location)
+        # ── Direct Overpass path ───────────────────────────────────────────────
+        logger.info("Therapist search via Overpass for location='%s'", location)
 
-        logger.info("Therapist search via Google Maps for location='%s'", location)
-        return _google_maps_search(api_key, location, specialty)
-
-
-# ── Google Maps helper ────────────────────────────────────────────────────────
-
-def _google_maps_search(api_key: str, location: str, specialty: str) -> str:
-    """
-    Calls Google Maps Places Text Search API.
-    Query: "psychiatrist OR psychologist OR therapist in <city>"
-    Returns formatted results string for the AI agent to use directly.
-    """
-    query = f"psychiatrist psychologist therapist mental health clinic in {location}"
-
-    try:
-        resp = requests.get(
-            PLACES_TEXT_SEARCH_URL,
-            params={
-                "query": query,
-                "key":   api_key,
-                "language": "en",
-            },
-            timeout=10,
-        )
-        data   = resp.json()
-        status = data.get("status")
-
-        # ── Handle API errors with clear messages ──────────────────────────
-        if status == "REQUEST_DENIED":
-            error_msg = data.get("error_message", "")
-            logger.error("Google Maps REQUEST_DENIED: %s", error_msg)
-            # This is the most common setup mistake — log clearly
+        lat, lon = _geocode(location)
+        if lat is None:
             return (
-                "⚠️ Google Maps API not configured correctly. "
-                "The Places API needs to be enabled in Google Cloud Console. "
-                f"Error: {error_msg}\n\n"
-                + _helpline_fallback(location)
+                f"I couldn't find the location '{location}' on the map. "
+                "Please try a nearby major city name (e.g. 'Nagpur', 'Mumbai')."
             )
 
-        if status == "OVER_DAILY_LIMIT" or status == "OVER_QUERY_LIMIT":
-            logger.error("Google Maps quota exceeded")
+        results = _overpass_search(lat, lon)
+
+        if not results:
             return (
-                "Google Maps quota reached for today. "
-                "Here are alternative ways to find help:\n\n"
-                + _helpline_fallback(location)
+                f"No mental health professionals found on OpenStreetMap near {location}. "
+                "OpenStreetMap data can be sparse in some areas. "
+                "You can also try: Practo.com, 1mg.com, or search 'therapist near me' on Google Maps. "
+                "iCall helpline: 9152987821 | Vandrevala Foundation: 1860-2662-345"
             )
 
-        if status == "INVALID_REQUEST":
-            logger.error("Google Maps INVALID_REQUEST for location='%s'", location)
-            return f"I couldn't search for that location. Try a city name like 'Nagpur' or 'Mumbai'."
+        lines = [f"Mental health professionals near {location} (via OpenStreetMap):\n"]
+        for i, place in enumerate(results[:5], 1):
+            name    = place.get("name", "Unnamed Clinic")
+            addr    = place.get("address", "Address not listed on map")
+            phone   = place.get("phone", "")
+            website = place.get("website", "")
 
-        if status == "ZERO_RESULTS":
-            return (
-                f"No mental health professionals found on Google Maps near {location}. "
-                "Try searching directly on Google Maps or Practo.com.\n\n"
-                + _helpline_fallback(location)
-            )
-
-        if status != "OK":
-            logger.warning("Google Maps unexpected status: %s", status)
-            return _no_api_fallback(location)
-
-        # ── Format results ─────────────────────────────────────────────────
-        places = data.get("results", [])[:5]
-        if not places:
-            return _no_api_fallback(location)
-
-        lines = [f"Mental health professionals near {location}:\n"]
-        for i, place in enumerate(places, 1):
-            name    = place.get("name", "Unknown")
-            address = place.get("formatted_address", "Address not available")
-            rating  = place.get("rating")
-            open_now = place.get("opening_hours", {}).get("open_now")
-
-            entry = f"{i}. {name}\n   📍 {address}"
-            if rating:
-                entry += f"\n   ⭐ {rating}/5"
-            if open_now is True:
-                entry += "  🟢 Open now"
-            elif open_now is False:
-                entry += "  🔴 Closed now"
+            entry = f"{i}. {name}\n   📍 {addr}"
+            if phone:
+                entry += f"\n   📞 {phone}"
+            if website:
+                entry += f"\n   🌐 {website}"
             lines.append(entry)
 
         lines.append(
-            "\n💡 For appointments and verified reviews, visit Practo.com\n"
-            "📞 iCall: 9152987821 | Vandrevala Foundation: 1860-2662-345"
+            "\n💡 Results from OpenStreetMap. For more options try Practo.com"
         )
-        logger.info("Google Maps returned %d results for '%s'", len(places), location)
+        logger.info("Overpass returned %d results for '%s'", len(results), location)
         return "\n\n".join(lines)
 
-    except requests.exceptions.Timeout:
-        logger.warning("Google Maps request timed out for '%s'", location)
-        return _no_api_fallback(location)
+
+# ── Helper functions ──────────────────────────────────────────────────────────
+
+def _geocode(location: str) -> tuple[float | None, float | None]:
+    """Convert a city/area name to (lat, lon) using Nominatim."""
+    try:
+        resp = requests.get(
+            NOMINATIM_URL,
+            params={"q": location, "format": "json", "limit": 1},
+            headers=HEADERS,
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if data:
+            return float(data[0]["lat"]), float(data[0]["lon"])
     except Exception as e:
-        logger.warning("Google Maps call failed for '%s': %s", location, e)
-        return _no_api_fallback(location)
+        logger.warning("Nominatim geocoding failed for '%s': %s", location, e)
+    return None, None
 
 
-# ── MCP bridge ────────────────────────────────────────────────────────────────
+def _overpass_search(lat: float, lon: float) -> list[dict]:
+    """
+    Query Overpass for mental health providers within SEARCH_RADIUS_M.
+    We cast a wide net with multiple OSM tag combinations.
+    """
+    query = f"""
+    [out:json][timeout:25];
+    (
+      node["healthcare"="psychotherapist"](around:{SEARCH_RADIUS_M},{lat},{lon});
+      node["healthcare"="psychiatrist"](around:{SEARCH_RADIUS_M},{lat},{lon});
+      node["amenity"="doctors"]["healthcare:speciality"~"psychiatry|psychology|mental_health",i](around:{SEARCH_RADIUS_M},{lat},{lon});
+      node["amenity"="clinic"]["healthcare:speciality"~"psychiatry|psychology|mental_health",i](around:{SEARCH_RADIUS_M},{lat},{lon});
+      node["amenity"="doctors"]["name"~"psychiatr|psycholog|counsel|therap|mental",i](around:{SEARCH_RADIUS_M},{lat},{lon});
+    );
+    out body 10;
+    """
+    try:
+        resp = requests.post(OVERPASS_URL, data={"data": query}, timeout=30)
+        resp.raise_for_status()
+        elements = resp.json().get("elements", [])
+        return [_parse_element(el) for el in elements if el.get("tags", {}).get("name")]
+    except Exception as e:
+        logger.warning("Overpass query failed: %s", e)
+        return []
 
-def _try_mcp(mcp_url: str, location: str, specialty: str) -> str | None:
-    """Call MCP server. Returns None if unreachable so caller can fallback."""
+
+def _parse_element(el: dict) -> dict:
+    """Extract clean fields from an Overpass node."""
+    tags = el.get("tags", {})
+    addr_parts = [
+        tags.get("addr:housenumber", ""),
+        tags.get("addr:street", ""),
+        tags.get("addr:city", ""),
+        tags.get("addr:postcode", ""),
+    ]
+    address = ", ".join(p for p in addr_parts if p) or tags.get("addr:full", "")
+    return {
+        "name":    tags.get("name", "Unknown"),
+        "address": address or "Address not listed",
+        "phone":   tags.get("phone") or tags.get("contact:phone", ""),
+        "website": tags.get("website") or tags.get("contact:website", ""),
+        "lat":     el.get("lat"),
+        "lon":     el.get("lon"),
+    }
+
+
+def _call_mcp_server(mcp_url: str, location: str, specialty: str) -> str:
+    """
+    Delegate the search to the MCP server when it's running.
+    The MCP server calls Overpass internally — same data, clean architecture.
+    Falls back to direct Overpass if MCP server is unreachable.
+    """
     try:
         resp = requests.post(
             f"{mcp_url.rstrip('/')}/search",
@@ -197,33 +209,75 @@ def _try_mcp(mcp_url: str, location: str, specialty: str) -> str | None:
             timeout=30,
         )
         resp.raise_for_status()
-        return resp.json().get("result")
+        return resp.json().get("result", "No results from MCP server.")
     except Exception as e:
-        logger.warning("MCP server unreachable (%s): %s — falling back to Google Maps", mcp_url, e)
-        return None
-
-
-# ── Fallback helpers ──────────────────────────────────────────────────────────
-
-def _helpline_fallback(location: str) -> str:
-    return (
-        f"Ways to find a therapist near {location}:\n"
-        "   • Practo.com → search 'psychiatrist' or 'psychologist'\n"
-        "   • 1mg.com → Mental Health section\n"
-        "   • iCliniq.com → online + in-person\n\n"
-        "📞 Free helplines:\n"
-        "   • iCall: 9152987821 (Mon–Sat, 8am–10pm)\n"
-        "   • Vandrevala Foundation: 1860-2662-345 (24/7)\n"
-        "   • NIMHANS: 080-46110007"
-    )
-
-
-def _no_api_fallback(location: str) -> str:
-    return (
-        f"I wasn't able to search Google Maps right now. "
-        + _helpline_fallback(location)
-    )
+        logger.warning("MCP server call failed (%s), falling back to direct Overpass: %s", mcp_url, e)
+        lat, lon = _geocode(location)
+        if lat is None:
+            return f"Could not find location '{location}'."
+        results = _overpass_search(lat, lon)
+        if not results:
+            return f"No therapists found near {location}. Try Practo.com or search Google Maps."
+        lines = [f"Mental health professionals near {location}:\n"]
+        for i, p in enumerate(results[:5], 1):
+            lines.append(f"{i}. {p['name']}\n   📍 {p['address']}")
+        return "\n\n".join(lines)
 
 
 # Singleton instance — imported directly by TherapistAgent
 find_therapists_tool = FindTherapistsTool()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FindDoctorsTool — same MCP server, medical specialties
+# Used by DoctorAgent when user asks for nearby doctors/specialists
+# ══════════════════════════════════════════════════════════════════════════════
+
+class DoctorSearchInput(BaseModel):
+    location: str = Field(
+        ...,
+        description="City or area to search in, e.g. 'Nagpur', 'Mumbai'"
+    )
+    specialty: str = Field(
+        default="doctor physician specialist clinic",
+        description="Type of doctor to search for, e.g. 'cardiologist', 'dermatologist'"
+    )
+
+
+class FindDoctorsTool(BaseTool):
+    """
+    Finds nearby doctors, physicians, and medical specialists using Google Maps.
+    Use this when the user asks for nearby doctors or specialists after
+    receiving medical guidance. Ask for their city first if not provided.
+    """
+    name: str = "find_nearby_doctors"
+    description: str = (
+        "Searches Google Maps for nearby doctors, physicians, and specialists. "
+        "Use ONLY when the user explicitly says yes to finding a doctor and provides a location. "
+        "Input: location (city name) and specialty based on their health concern."
+    )
+    args_schema: type[BaseModel] = DoctorSearchInput
+
+    def _run(self, location: str, specialty: str = "doctor physician clinic") -> str:
+
+        # Route through MCP server if configured
+        mcp_url = getattr(settings, "therapist_mcp_url", "")
+        if mcp_url:
+            result = _try_mcp(mcp_url, location, specialty)
+            if result:
+                return result
+
+        # Direct Google Maps search
+        api_key = getattr(settings, "google_maps_api_key", "")
+        if not api_key:
+            return _no_api_fallback(location)
+
+        # Build a specific query based on specialty
+        query = f"{specialty} doctor hospital clinic in {location}"
+        logger.info("Doctor search via Google Maps: '%s' near '%s'", specialty, location)
+        return _google_maps_search(api_key, location, specialty)
+
+
+# Singleton instances
+find_therapists_tool = FindTherapistsTool()
+find_doctors_tool    = FindDoctorsTool()
