@@ -74,14 +74,13 @@ PLACES_TEXT_SEARCH_URL = "https://maps.googleapis.com/maps/api/place/textsearch/
 # In-memory cache — avoids duplicate API calls within the same session
 _cache: dict[str, str] = {}
 
-# Google Maps API key — read at request time so it picks up HF injected env
+# Google Maps API key — read directly from os.environ
+# therapist_directory.py runs as a subprocess so 'core' module is NOT in path.
+# os.environ works because hf_app.py injects GOOGLE_MAPS_API_KEY before
+# starting this subprocess.
 def _get_api_key() -> str:
     import os
-    from core.config import get_settings
-    try:
-        return get_settings().google_maps_api_key
-    except Exception:
-        return os.environ.get("GOOGLE_MAPS_API_KEY", "")
+    return os.environ.get("GOOGLE_MAPS_API_KEY", "")
 
 
 # ── Request / Response schemas ────────────────────────────────────────────────
