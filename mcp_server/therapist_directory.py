@@ -25,15 +25,8 @@ HOW THE FLOW WORKS:
 User asks → TherapistAgent decides to find therapists
     → calls find_nearby_therapists tool (maps_tool.py)
         → maps_tool.py calls THIS MCP server via HTTP
-            → MCP server geocodes + calls Overpass API
+            → MCP server geocodes 
                 → returns formatted results back up the chain
-
-WHY THIS IS INTERVIEW-WORTHY:
-===============================
-1. You separated business logic (therapist search) from agent logic
-2. The search service is now independently deployable and testable
-3. Any future agent or app can use it — you're thinking at scale
-4. MCP is Anthropic's open standard — shows you follow the ecosystem
 
 RUNNING THIS SERVER:
 ====================
@@ -69,20 +62,26 @@ app = FastAPI(
     title="SafeSpace Healthcare Directory MCP Server",
     description=(
         "MCP-compatible server that exposes therapist search tools "
-        "backed by OpenStreetMap / Overpass API. "
-        "No API keys required."
+        "backed by Google Maps Places API. "
+        "Requires GOOGLE_MAPS_API_KEY."
     ),
     version="1.0.0",
 )
 
-# OSM endpoints
-NOMINATIM_URL   = "https://nominatim.openstreetmap.org/search"
-OVERPASS_URL    = "https://overpass-api.de/api/interpreter"
-OSM_HEADERS     = {"User-Agent": "SafeSpace-MCP/1.0 (mental health tool)"}
-SEARCH_RADIUS_M = 5000
+# Google Maps Places API (no rate limits at our scale, real India data)
+PLACES_TEXT_SEARCH_URL = "https://maps.googleapis.com/maps/api/place/textsearch/json"
 
-# ── In-memory cache so we don't hammer Overpass on repeated queries ───────────
-_cache: dict[str, list[dict]] = {}
+# In-memory cache — avoids duplicate API calls within the same session
+_cache: dict[str, str] = {}
+
+# Google Maps API key — read at request time so it picks up HF injected env
+def _get_api_key() -> str:
+    import os
+    from core.config import get_settings
+    try:
+        return get_settings().google_maps_api_key
+    except Exception:
+        return os.environ.get("GOOGLE_MAPS_API_KEY", "")
 
 
 # ── Request / Response schemas ────────────────────────────────────────────────
@@ -156,53 +155,43 @@ def search_by_location(req: SearchRequest):
     """
     MCP Tool 1: search_by_location
     ================================
-    Geocodes the city, then queries Overpass for mental health providers.
+    Queries Google Maps Places API for mental health providers near the location.
+    No geocoding step needed — Google Maps handles location resolution internally.
     Returns both structured data (for apps) and a pre-formatted string
     (so AI agents can paste it directly into their response).
     """
     logger.info("MCP search_by_location: location='%s' specialty='%s'", req.location, req.specialty)
 
-    radius_m = req.radius_km * 1000
-
-    # Geocode
-    lat, lon = _geocode(req.location)
-    if lat is None:
-        no_result_text = (
-            f"I couldn't find '{req.location}' on the map. "
-            "Please try a major city name like 'Nagpur' or 'Mumbai'."
-        )
+    # Check cache first
+    cache_key = f"{req.location.lower()}:{req.specialty.lower()}"
+    if cache_key in _cache:
+        logger.info("Cache hit for '%s'", req.location)
         return SearchResponse(
-            location=req.location, count=0, results=[], result=no_result_text
+            location=req.location,
+            count=1,
+            results=[],
+            result=_cache[cache_key],
         )
 
-    # Check cache
-    cache_key = f"{lat:.3f},{lon:.3f},{radius_m}"
-    if cache_key not in _cache:
-        _cache[cache_key] = _overpass_search(lat, lon, radius_m)
-    results = _cache[cache_key]
-
-    # Format for agent
-    if not results:
-        formatted = (
-            f"No mental health professionals found near {req.location} on OpenStreetMap. "
-            "OSM data can be sparse. Try Practo.com, 1mg.com, or iCall: 9152987821."
+    # Google Maps Places search — no geocoding needed
+    api_key = _get_api_key()
+    if not api_key:
+        fallback = (
+            f"Google Maps API key not configured. "
+            f"For therapists near {req.location}, try Practo.com "
+            f"or call iCall: 9152987821."
         )
-    else:
-        lines = [f"Mental health professionals near {req.location}:\n"]
-        for i, p in enumerate(results[:5], 1):
-            entry = f"{i}. {p['name']}\n   📍 {p['address']}"
-            if p.get("phone"):
-                entry += f"\n   📞 {p['phone']}"
-            if p.get("website"):
-                entry += f"\n   🌐 {p['website']}"
-            lines.append(entry)
-        lines.append("\n💡 Data from OpenStreetMap. Also try Practo.com for more options.")
-        formatted = "\n\n".join(lines)
+        return SearchResponse(location=req.location, count=0, results=[], result=fallback)
+
+    formatted = _google_maps_search(api_key, req.location)
+
+    # Cache the result
+    _cache[cache_key] = formatted
 
     return SearchResponse(
         location=req.location,
-        count=len(results),
-        results=results[:5],
+        count=1,
+        results=[],
         result=formatted,
     )
 
@@ -275,64 +264,79 @@ def health():
     return {"status": "ok", "server": "SafeSpace Healthcare Directory MCP", "version": "1.0.0"}
 
 
-# ── Internal helpers (same logic as maps_tool.py, centralised here) ───────────
+# ── Internal helpers ─────────────────────────────────────────────────────────
 
-def _geocode(location: str):
+def _google_maps_search(api_key: str, location: str) -> str:
+    """
+    Calls Google Maps Places API textsearch endpoint.
+    Returns a formatted string ready for the AI agent to use.
+    Same logic as maps_tool.py — centralised here in the MCP server.
+    """
+    query = f"psychiatrist psychologist therapist mental health clinic in {location}"
     try:
         resp = requests.get(
-            NOMINATIM_URL,
-            params={"q": location, "format": "json", "limit": 1},
-            headers=OSM_HEADERS,
+            PLACES_TEXT_SEARCH_URL,
+            params={"query": query, "key": api_key, "language": "en"},
             timeout=10,
         )
-        resp.raise_for_status()
-        data = resp.json()
-        if data:
-            return float(data[0]["lat"]), float(data[0]["lon"])
+        data   = resp.json()
+        status = data.get("status")
+
+        if status == "REQUEST_DENIED":
+            logger.error("Google Maps REQUEST_DENIED: %s", data.get("error_message"))
+            return _fallback(location)
+        if status == "ZERO_RESULTS":
+            logger.info("Google Maps ZERO_RESULTS for '%s'", location)
+            return _fallback(location)
+        if status != "OK":
+            logger.warning("Google Maps unexpected status '%s' for '%s'", status, location)
+            return _fallback(location)
+
+        places = data.get("results", [])[:5]
+        if not places:
+            return _fallback(location)
+
+        lines = [f"Mental health professionals near {location}:\n"]
+        for i, p in enumerate(places, 1):
+            name     = p.get("name", "Unknown")
+            address  = p.get("formatted_address", "Address not available")
+            rating   = p.get("rating")
+            open_now = p.get("opening_hours", {}).get("open_now")
+
+            entry = f"{i}. {name}\n   📍 {address}"
+            if rating:
+                entry += f"\n   ⭐ {rating}/5"
+            if open_now is True:
+                entry += "  🟢 Open now"
+            elif open_now is False:
+                entry += "  🔴 Closed now"
+            lines.append(entry)
+
+        lines.append(
+            "\n💡 For appointments and reviews visit Practo.com\n"
+            "📞 iCall: 9152987821 | Vandrevala Foundation: 1860-2662-345"
+        )
+        logger.info("Google Maps returned %d results for '%s'", len(places), location)
+        return "\n\n".join(lines)
+
+    except requests.exceptions.Timeout:
+        logger.warning("Google Maps timeout for '%s'", location)
+        return _fallback(location)
     except Exception as e:
-        logger.warning("Geocoding failed for '%s': %s", location, e)
-    return None, None
+        logger.warning("Google Maps error for '%s': %s", location, e)
+        return _fallback(location)
 
 
-def _overpass_search(lat: float, lon: float, radius_m: int) -> list[dict]:
-    query = f"""
-    [out:json][timeout:25];
-    (
-      node["healthcare"="psychotherapist"](around:{radius_m},{lat},{lon});
-      node["healthcare"="psychiatrist"](around:{radius_m},{lat},{lon});
-      node["amenity"="doctors"]["healthcare:speciality"~"psychiatry|psychology|mental_health",i](around:{radius_m},{lat},{lon});
-      node["amenity"="clinic"]["healthcare:speciality"~"psychiatry|psychology|mental_health",i](around:{radius_m},{lat},{lon});
-      node["amenity"="doctors"]["name"~"psychiatr|psycholog|counsel|therap|mental",i](around:{radius_m},{lat},{lon});
-    );
-    out body 10;
-    """
-    try:
-        resp = requests.post(OVERPASS_URL, data={"data": query}, timeout=30)
-        resp.raise_for_status()
-        elements = resp.json().get("elements", [])
-        return [_parse_element(el) for el in elements if el.get("tags", {}).get("name")]
-    except Exception as e:
-        logger.warning("Overpass query failed: %s", e)
-        return []
-
-
-def _parse_element(el: dict) -> dict:
-    tags = el.get("tags", {})
-    addr_parts = [
-        tags.get("addr:housenumber", ""),
-        tags.get("addr:street", ""),
-        tags.get("addr:city", ""),
-        tags.get("addr:postcode", ""),
-    ]
-    address = ", ".join(p for p in addr_parts if p) or tags.get("addr:full", "")
-    return {
-        "name":    tags.get("name", "Unknown"),
-        "address": address or "Address not listed",
-        "phone":   tags.get("phone") or tags.get("contact:phone", ""),
-        "website": tags.get("website") or tags.get("contact:website", ""),
-        "lat":     el.get("lat"),
-        "lon":     el.get("lon"),
-    }
+def _fallback(location: str) -> str:
+    return (
+        f"I couldn't find listings near {location} right now. "
+        "Please try:\n"
+        "   • Practo.com → search 'psychiatrist' or 'psychologist'\n"
+        "   • 1mg.com → Mental Health section\n\n"
+        "📞 Free helplines:\n"
+        "   • iCall: 9152987821 (Mon–Sat 8am–10pm)\n"
+        "   • Vandrevala Foundation: 1860-2662-345 (24/7)"
+    )
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
