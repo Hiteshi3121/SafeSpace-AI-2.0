@@ -4,14 +4,16 @@ hf_app.py — SafeSpace AI combined server
 ARCHITECTURE (with Nginx):
 ===========================
 Nginx (port 7860, public)
-  ├── /whatsapp/*  →  FastAPI (port 8000) — Twilio webhook
-  ├── /health      →  FastAPI (port 8000) — health check
+  ├── /whatsapp/*  →  FastAPI   (port 8000) — Twilio webhook
+  ├── /health      →  FastAPI   (port 8000) — health check
+  ├── /mcp/*       →  MCP Server(port 8001) — therapist directory tools
   └── /*           →  Streamlit (port 8501) — Web UI with proper WebSocket
 
-This file starts all 3 processes:
-  1. FastAPI on 8000
-  2. Streamlit on 8501
-  3. Nginx on 7860
+This file starts all 4 processes:
+  1. FastAPI    on 8000  (WhatsApp webhook)
+  2. MCP Server on 8001  (therapist directory)
+  3. Streamlit  on 8501  (web UI)
+  4. Nginx      on 7860  (public router)
 
 WHY NGINX instead of Python proxy:
   Nginx properly upgrades HTTP→WebSocket (Upgrade header).
@@ -51,10 +53,13 @@ try:
         "LANGSMITH_API_KEY":    _s.langsmith_api_key,
         "LANGCHAIN_TRACING_V2": "true" if _s.langsmith_api_key else "false",
         "LANGCHAIN_PROJECT":    _s.langsmith_project,
+        # Point maps_tool.py to the MCP server running internally on port 8001
+        # This makes TherapistAgent use MCP → Google Maps instead of direct call
+        "THERAPIST_MCP_URL":    "http://127.0.0.1:8001",
     }.items():
         if v:
             os.environ.setdefault(k, v)
-    logger.info("Secrets loaded — Twilio=%s Maps=%s LangSmith=%s",
+    logger.info("Secrets loaded — Twilio=%s Maps=%s LangSmith=%s MCP=enabled",
                 _s.twilio_configured, _s.maps_configured, _s.langsmith_configured)
 except Exception as e:
     logger.warning("Settings warning: %s", e)
@@ -90,6 +95,26 @@ def start_fastapi():
         logger.info("FastAPI ready — webhook at /whatsapp/webhook")
 
     uvicorn.run(app, host="127.0.0.1", port=8000, log_level="warning")
+
+
+def start_mcp_server():
+    """
+    MCP Server on port 8001 — therapist directory tools.
+
+    Runs mcp_server/therapist_directory.py as a subprocess.
+    maps_tool.py routes to this via THERAPIST_MCP_URL=http://127.0.0.1:8001
+    instead of calling Google Maps directly.
+
+    WHY run as subprocess (not thread)?
+    uvicorn.run() blocks. If we ran two uvicorn servers in threads they would
+    fight over the event loop. Subprocess gives each its own Python process
+    and its own event loop — clean separation.
+    """
+    mcp_script = str(ROOT / "mcp_server" / "therapist_directory.py")
+    cmd = [sys.executable, mcp_script]
+    logger.info("Starting MCP server on port 8001...")
+    proc = subprocess.Popen(cmd, env=os.environ.copy())
+    return proc
 
 
 def start_streamlit():
@@ -137,6 +162,15 @@ http {
             proxy_pass http://127.0.0.1:8000/health;
             proxy_set_header Host $host;
         }
+
+        # MCP server — therapist directory tools
+        # External URL: https://hiteshiaglawe0505-safespace-ai.hf.space/mcp/
+        location /mcp/ {
+            proxy_pass http://127.0.0.1:8001/;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_read_timeout 30s;
+        }
         
         location / {
             proxy_pass http://127.0.0.1:8501/;
@@ -162,25 +196,29 @@ http {
 
 
 if __name__ == "__main__":
-    logger.info("="*55)
+    logger.info("="*60)
     logger.info("SafeSpace AI 2.0 — Starting all services")
-    logger.info("  Streamlit (Web UI):  port 8501 (internal)")
-    logger.info("  FastAPI  (Webhook):  port 8000 (internal)")
-    logger.info("  Nginx    (Public):   port 7860 → routes both")
-    logger.info("="*55)
+    logger.info("  FastAPI    (Webhook):    port 8000 (internal)")
+    logger.info("  MCP Server (Therapists): port 8001 (internal)")
+    logger.info("  Streamlit  (Web UI):     port 8501 (internal)")
+    logger.info("  Nginx      (Public):     port 7860 → routes all")
+    logger.info("="*60)
 
     # 1. Start FastAPI in background thread
     fastapi_thread = threading.Thread(target=start_fastapi, daemon=True, name="FastAPI")
     fastapi_thread.start()
 
-    # 2. Start Streamlit subprocess
+    # 2. Start MCP server subprocess (therapist directory)
+    mcp_proc = start_mcp_server()
+
+    # 3. Start Streamlit subprocess (web UI)
     streamlit_proc = start_streamlit()
 
-    # 3. Wait for both to be ready before starting Nginx
-    logger.info("Waiting 10s for services to initialize...")
-    time.sleep(10)
+    # 4. Wait for all services to be ready before starting Nginx
+    logger.info("Waiting 12s for all services to initialize...")
+    time.sleep(12)
 
-    # 4. Start Nginx (routes all public traffic)
+    # 5. Start Nginx (routes all public traffic)
     nginx_proc = start_nginx()
 
     logger.info("All services running. Webhook URL:")
@@ -193,4 +231,5 @@ if __name__ == "__main__":
         logger.info("Shutting down...")
     finally:
         streamlit_proc.terminate()
+        mcp_proc.terminate()
         nginx_proc.terminate()
