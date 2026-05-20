@@ -1,9 +1,9 @@
 fastapi>=0.115.0
 uvicorn>=0.30.0
 python-multipart>=0.0.9
-crewai>=1.14.4
+crewai==1.14.4
 crewai-tools>=0.15.0
-litellm>=1.83.0
+litellm==1.83.0
 groq>=0.11.0
 langsmith>=0.1.0
 pydantic>=2.7.0
