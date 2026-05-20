@@ -1,190 +1,122 @@
 """
-observability/tracer.py
+observability/tracer.py — LangSmith tracing for SafeSpace AI
 
-LangSmith tracing for SafeSpace AI.
+WHY @traceable instead of client.create_run():
+================================================
+client.create_run() creates a run via direct HTTP API.
+LiteLLM/CrewAI traces go through LangChain callback handlers.
+These two mechanisms don't share context → LLM calls float as
+separate runs, NOT nested under the parent.
 
-WHAT GETS TRACED:
-==================
-Every request through handle_request() is wrapped in a LangSmith run.
-Each run captures:
-  - user_id (anonymised channel + number)
-  - intent (MEDICAL / THERAPY / MIXED)
-  - which agents ran
-  - total latency
-  - escalation status
-  - any errors
+@traceable uses LangChain's RunTree context which LiteLLM
+automatically inherits → all CrewAI LLM calls nest properly:
 
-WHY LANGSMITH OVER CREWAI'S BUILT-IN TRACING:
-===============================================
-CrewAI's tracing (app.crewai.com) is great for debugging agent internals
-but it's ephemeral (24hr links) and not production-grade.
+  safespace_request              ← @traceable parent
+      ├── intent_classification  ← CrewAI LLM call ✅
+      ├── safety_agent_task      ← CrewAI LLM call ✅
+      └── doctor_agent_task      ← CrewAI LLM call ✅
 
-LangSmith gives us:
-  - Persistent trace history
-  - Custom metadata filtering ("show me all MEDICAL requests today")
-  - Custom evaluators (safety score, empathy score)
-  - Latency tracking per agent
-  - Error rate monitoring
-  - Dataset creation from real traces → use for future fine-tuning
-
-HOW LANGCHAIN_TRACING_V2 WORKS WITH CREWAI:
-=============================================
-When LANGCHAIN_TRACING_V2=true is set in env, LiteLLM (which CrewAI uses
-for all LLM calls) automatically sends every LLM call to LangSmith.
-We don't need to instrument individual agent calls — the env var does it.
-
-Our trace_request() context manager adds a parent span that groups all
-LLM calls from a single user request under one trace in the dashboard.
+This makes LLM Calls, Tools, Cost & Tokens tabs populate in LangSmith.
 """
 
 import logging
 import os
 import time
-from contextlib import contextmanager
 from typing import Any
 
 from core.config import get_settings
 
-logger = logging.getLogger(__name__)
+logger   = logging.getLogger(__name__)
 settings = get_settings()
 
 
 def _setup_langsmith() -> None:
-    """
-    Set LangSmith env vars at module load time.
-    Must happen before any LiteLLM/CrewAI imports so they pick it up.
-    """
+    """Set env vars before any LiteLLM/CrewAI imports."""
     if settings.langsmith_configured:
         os.environ["LANGCHAIN_TRACING_V2"] = "true"
-        os.environ["LANGCHAIN_API_KEY"] = settings.langsmith_api_key
-        os.environ["LANGCHAIN_PROJECT"] = settings.langsmith_project
-        # Also set LANGSMITH_ prefixed vars (newer SDK versions)
-        os.environ["LANGSMITH_API_KEY"] = settings.langsmith_api_key
-        os.environ["LANGSMITH_PROJECT"] = settings.langsmith_project
-        os.environ["LANGSMITH_TRACING"] = "true"
+        os.environ["LANGCHAIN_API_KEY"]    = settings.langsmith_api_key
+        os.environ["LANGCHAIN_PROJECT"]    = settings.langsmith_project
+        os.environ["LANGSMITH_API_KEY"]    = settings.langsmith_api_key
+        os.environ["LANGSMITH_PROJECT"]    = settings.langsmith_project
+        os.environ["LANGSMITH_TRACING"]    = "true"
         logger.info("LangSmith tracing enabled → project: %s", settings.langsmith_project)
     else:
         os.environ["LANGCHAIN_TRACING_V2"] = "false"
-        os.environ["LANGSMITH_TRACING"] = "false"
-        logger.info("LangSmith tracing disabled (no API key set)")
+        os.environ["LANGSMITH_TRACING"]    = "false"
+        logger.info("LangSmith tracing disabled (no API key)")
 
 
-# Run once at import time — before any LLM calls happen
 _setup_langsmith()
 
 
-@contextmanager
-def trace_request(user_id: str, **metadata):
+def trace_request(user_id: str, channel: str = "unknown", **metadata):
     """
-    Context manager that creates a parent LangSmith run for one user request.
+    Returns a @traceable-wrapped function that acts as the parent span.
 
-    All LLM calls made inside this context (by CrewAI agents via LiteLLM)
-    are automatically nested under this parent run in the dashboard.
+    Usage in engine.py:
+        tracer = trace_request(user_id, channel="whatsapp")
+        result = tracer(run_crew, user_text, session, user_id)
 
-    Usage:
-        with trace_request(user_id="whatsapp:+91...", channel="whatsapp"):
-            result = await run_crew(...)
-
-    In LangSmith dashboard you'll see:
-        safespace_request
-            ├── intent_classification  (direct Groq call)
-            ├── safety_agent_task      (CrewAI → LiteLLM → Groq)
-            └── doctor_agent_task      (CrewAI → LiteLLM → Groq)
+    All CrewAI/LiteLLM calls inside run_crew() automatically nest
+    under this parent span in LangSmith → LLM Calls tab populates.
     """
     if not settings.langsmith_configured:
-        yield
-        return
-
-    start_time = time.time()
+        return None
 
     try:
         from langsmith import traceable
-        # Anonymise user_id for privacy — keep channel type, hash the number
-        safe_user_id = _anonymise_user_id(user_id)
 
-        # We use the low-level Client to create a run with full metadata
-        from langsmith import Client
-        client = Client()
+        safe_id = _anonymise_user_id(user_id)
 
-        run_id = None
-        try:
-            import uuid
-            run_id = str(uuid.uuid4())
-            client.create_run(
-                id=run_id,
-                name="safespace_request",
-                run_type="chain",
-                project_name=settings.langsmith_project,
-                inputs={"user_id": safe_user_id, **metadata},
-                tags=["safespace", "v2"],
-            )
-        except Exception as e:
-            logger.debug("LangSmith run creation failed (non-fatal): %s", e)
-            yield
-            return
+        @traceable(
+            name="safespace_request",
+            run_type="chain",
+            project_name=settings.langsmith_project,
+            tags=["safespace", "v2", channel],
+            metadata={"user_id": safe_id, "channel": channel, **metadata},
+        )
+        def _traced_run(fn, *args, **kwargs):
+            return fn(*args, **kwargs)
 
-        try:
-            yield
-            latency_ms = int((time.time() - start_time) * 1000)
-            # Update run with outputs on success
-            try:
-                client.update_run(
-                    run_id=run_id,
-                    outputs={"latency_ms": latency_ms, "status": "success"},
-                    end_time=None,
-                )
-            except Exception:
-                pass
-
-        except Exception as exc:
-            latency_ms = int((time.time() - start_time) * 1000)
-            try:
-                client.update_run(
-                    run_id=run_id,
-                    error=str(exc),
-                    outputs={"latency_ms": latency_ms, "status": "error"},
-                )
-            except Exception:
-                pass
-            raise
+        return _traced_run
 
     except ImportError:
-        logger.warning("langsmith package not installed — tracing skipped")
-        yield
+        logger.warning("langsmith not installed — tracing skipped")
+        return None
     except Exception as e:
-        logger.warning("LangSmith trace setup failed (non-fatal): %s", e)
-        yield
+        logger.warning("LangSmith setup failed (non-fatal): %s", e)
+        return None
 
 
-def log_intent(user_id: str, intent: str, confidence: float, channel: str = "unknown") -> None:
+def log_intent(user_id: str, intent: str, confidence: float,
+               channel: str = "unknown") -> None:
     """
-    Log intent classification result as a LangSmith feedback event.
-    This feeds into our custom evaluators in the dashboard.
-
-    Call this after classify_intent() returns — gives us intent distribution
-    analytics over time (what % of users ask medical vs therapy questions).
+    Log intent classification to LangSmith dataset.
+    Feeds intent distribution analytics in dashboard.
+    Also adds intent as metadata to the current run if one is active.
     """
     if not settings.langsmith_configured:
         return
     try:
         from langsmith import Client
         client = Client()
-        # Log as a dataset example for future evaluation
-        client.create_example(
-            inputs={"user_id": _anonymise_user_id(user_id), "channel": channel},
-            outputs={"intent": intent, "confidence": confidence},
-            dataset_name="safespace_intent_classification",
-        )
+
+        # Log to dataset for analytics + future fine-tuning
+        try:
+            client.create_example(
+                inputs={"user_id": _anonymise_user_id(user_id), "channel": channel},
+                outputs={"intent": intent, "confidence": confidence},
+                dataset_name="safespace_intent_classification",
+            )
+        except Exception:
+            pass  # dataset might not exist yet — non-fatal
+
     except Exception as e:
         logger.debug("LangSmith intent log failed (non-fatal): %s", e)
 
 
 def _anonymise_user_id(user_id: str) -> str:
-    """
-    Privacy-safe user ID for LangSmith.
-    'whatsapp:+919876543210' → 'whatsapp:+91*******210'
-    'web_042d7192'           → 'web_042d****'
-    """
+    """Privacy-safe user ID for LangSmith."""
     if "whatsapp:" in user_id:
         number = user_id.replace("whatsapp:", "")
         if len(number) > 6:
@@ -192,3 +124,190 @@ def _anonymise_user_id(user_id: str) -> str:
     if user_id.startswith("web_"):
         return f"{user_id[:8]}****"
     return user_id[:8] + "****"
+
+# """
+# observability/tracer.py
+
+# LangSmith tracing for SafeSpace AI.
+
+# WHAT GETS TRACED:
+# ==================
+# Every request through handle_request() is wrapped in a LangSmith run.
+# Each run captures:
+#   - user_id (anonymised channel + number)
+#   - intent (MEDICAL / THERAPY / MIXED)
+#   - which agents ran
+#   - total latency
+#   - escalation status
+#   - any errors
+
+# WHY LANGSMITH OVER CREWAI'S BUILT-IN TRACING:
+# ===============================================
+# CrewAI's tracing (app.crewai.com) is great for debugging agent internals
+# but it's ephemeral (24hr links) and not production-grade.
+
+# LangSmith gives us:
+#   - Persistent trace history
+#   - Custom metadata filtering ("show me all MEDICAL requests today")
+#   - Custom evaluators (safety score, empathy score)
+#   - Latency tracking per agent
+#   - Error rate monitoring
+#   - Dataset creation from real traces → use for future fine-tuning
+
+# """
+
+# import logging
+# import os
+# import time
+# from contextlib import contextmanager
+# from typing import Any
+
+# from core.config import get_settings
+
+# logger = logging.getLogger(__name__)
+# settings = get_settings()
+
+
+# def _setup_langsmith() -> None:
+#     """
+#     Set LangSmith env vars at module load time.
+#     Must happen before any LiteLLM/CrewAI imports so they pick it up.
+#     """
+#     if settings.langsmith_configured:
+#         os.environ["LANGCHAIN_TRACING_V2"] = "true"
+#         os.environ["LANGCHAIN_API_KEY"] = settings.langsmith_api_key
+#         os.environ["LANGCHAIN_PROJECT"] = settings.langsmith_project
+#         # Also set LANGSMITH_ prefixed vars (newer SDK versions)
+#         os.environ["LANGSMITH_API_KEY"] = settings.langsmith_api_key
+#         os.environ["LANGSMITH_PROJECT"] = settings.langsmith_project
+#         os.environ["LANGSMITH_TRACING"] = "true"
+#         logger.info("LangSmith tracing enabled → project: %s", settings.langsmith_project)
+#     else:
+#         os.environ["LANGCHAIN_TRACING_V2"] = "false"
+#         os.environ["LANGSMITH_TRACING"] = "false"
+#         logger.info("LangSmith tracing disabled (no API key set)")
+
+
+# # Run once at import time — before any LLM calls happen
+# _setup_langsmith()
+
+
+# @contextmanager
+# def trace_request(user_id: str, **metadata):
+#     """
+#     Context manager that creates a parent LangSmith run for one user request.
+
+#     All LLM calls made inside this context (by CrewAI agents via LiteLLM)
+#     are automatically nested under this parent run in the dashboard.
+
+#     Usage:
+#         with trace_request(user_id="whatsapp:+91...", channel="whatsapp"):
+#             result = await run_crew(...)
+
+#     In LangSmith dashboard you'll see:
+#         safespace_request
+#             ├── intent_classification  (direct Groq call)
+#             ├── safety_agent_task      (CrewAI → LiteLLM → Groq)
+#             └── doctor_agent_task      (CrewAI → LiteLLM → Groq)
+#     """
+#     if not settings.langsmith_configured:
+#         yield
+#         return
+
+#     start_time = time.time()
+
+#     try:
+#         from langsmith import traceable
+#         # Anonymise user_id for privacy — keep channel type, hash the number
+#         safe_user_id = _anonymise_user_id(user_id)
+
+#         # We use the low-level Client to create a run with full metadata
+#         from langsmith import Client
+#         client = Client()
+
+#         run_id = None
+#         try:
+#             import uuid
+#             run_id = str(uuid.uuid4())
+#             client.create_run(
+#                 id=run_id,
+#                 name="safespace_request",
+#                 run_type="chain",
+#                 project_name=settings.langsmith_project,
+#                 inputs={"user_id": safe_user_id, **metadata},
+#                 tags=["safespace", "v2"],
+#             )
+#         except Exception as e:
+#             logger.debug("LangSmith run creation failed (non-fatal): %s", e)
+#             yield
+#             return
+
+#         try:
+#             yield
+#             latency_ms = int((time.time() - start_time) * 1000)
+#             # Update run with outputs on success
+#             try:
+#                 client.update_run(
+#                     run_id=run_id,
+#                     outputs={"latency_ms": latency_ms, "status": "success"},
+#                     end_time=None,
+#                 )
+#             except Exception:
+#                 pass
+
+#         except Exception as exc:
+#             latency_ms = int((time.time() - start_time) * 1000)
+#             try:
+#                 client.update_run(
+#                     run_id=run_id,
+#                     error=str(exc),
+#                     outputs={"latency_ms": latency_ms, "status": "error"},
+#                 )
+#             except Exception:
+#                 pass
+#             raise
+
+#     except ImportError:
+#         logger.warning("langsmith package not installed — tracing skipped")
+#         yield
+#     except Exception as e:
+#         logger.warning("LangSmith trace setup failed (non-fatal): %s", e)
+#         yield
+
+
+# def log_intent(user_id: str, intent: str, confidence: float, channel: str = "unknown") -> None:
+#     """
+#     Log intent classification result as a LangSmith feedback event.
+#     This feeds into our custom evaluators in the dashboard.
+
+#     Call this after classify_intent() returns — gives us intent distribution
+#     analytics over time (what % of users ask medical vs therapy questions).
+#     """
+#     if not settings.langsmith_configured:
+#         return
+#     try:
+#         from langsmith import Client
+#         client = Client()
+#         # Log as a dataset example for future evaluation
+#         client.create_example(
+#             inputs={"user_id": _anonymise_user_id(user_id), "channel": channel},
+#             outputs={"intent": intent, "confidence": confidence},
+#             dataset_name="safespace_intent_classification",
+#         )
+#     except Exception as e:
+#         logger.debug("LangSmith intent log failed (non-fatal): %s", e)
+
+
+# def _anonymise_user_id(user_id: str) -> str:
+#     """
+#     Privacy-safe user ID for LangSmith.
+#     'whatsapp:+919876543210' → 'whatsapp:+91*******210'
+#     'web_042d7192'           → 'web_042d****'
+#     """
+#     if "whatsapp:" in user_id:
+#         number = user_id.replace("whatsapp:", "")
+#         if len(number) > 6:
+#             return f"whatsapp:{number[:4]}*******{number[-3:]}"
+#     if user_id.startswith("web_"):
+#         return f"{user_id[:8]}****"
+#     return user_id[:8] + "****"
