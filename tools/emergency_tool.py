@@ -30,6 +30,15 @@ from crewai.tools import BaseTool
 from pydantic import BaseModel, Field
 from core.config import get_settings
 
+
+def _get_traceable():
+    """Lazy import so tool works even if langsmith not installed."""
+    try:
+        from langsmith import traceable
+        return traceable
+    except ImportError:
+        return lambda *a, **k: (lambda f: f)
+
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
@@ -54,7 +63,24 @@ class EmergencyCallTool(BaseTool):
     args_schema: type[BaseModel] = EmergencyCallInput
 
     def _run(self, reason: str) -> str:
-        """Execute the emergency call via Twilio."""
+        """Execute the emergency call via Twilio — traced in LangSmith."""
+        traceable = _get_traceable()
+
+        @traceable(
+            name="emergency_call",
+            run_type="tool",
+            metadata={"reason": reason, "tool": "twilio_voice"},
+        )
+        def _traced_run():
+            return self._run_impl(reason)
+
+        try:
+            return _traced_run()
+        except Exception:
+            return self._run_impl(reason)
+
+    def _run_impl(self, reason: str) -> str:
+        """Actual emergency call logic."""
         if not settings.twilio_configured:
             logger.warning("Emergency call requested but Twilio not configured")
             return "EMERGENCY_NOTED: Twilio not configured — log this incident manually."

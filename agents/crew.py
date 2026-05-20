@@ -186,6 +186,24 @@ def _extract_location_with_llm(user_text: str) -> str | None:
 
 
 
+def _setup_litellm_langsmith() -> None:
+    """
+    Explicitly register LangSmith as a LiteLLM success callback.
+    This ensures every Groq LLM call goes to LangSmith as an "llm" run.
+    These appear in LangSmith Tracing > Runs tab (filter run_type=llm).
+    The Monitoring > LLM Calls tab requires nested parent runs which
+    requires CrewAI version > 1.14.4 (blocked by cache_breakpoint bug).
+    """
+    try:
+        import litellm
+        if "langsmith" not in (litellm.success_callback or []):
+            litellm.success_callback = ["langsmith"]
+        if "langsmith" not in (litellm._async_success_callback or []):
+            litellm._async_success_callback = ["langsmith"]
+    except Exception:
+        pass  # non-fatal — tracing is best-effort
+
+
 async def run_crew(
     user_text: str,
     session: UserSession,
@@ -261,7 +279,7 @@ Safety check result is in your context. The user is not in crisis.
 
 RESPONSE: 2 paragraphs only.
 - Paragraph 1: Medical info — causes, home care, warning signs. Be specific.
-- Paragraph 2: One empathetic sentence. One sentence to see a doctor if the symptoms are concerning. dont always recommend a doctor visit if the symptoms are mild and can be treated with home care. Use your medical knowledge to differentiate between mild and severe symptoms and provide appropriate guidance. If the symptoms are mild and can be managed with home care, provide clear instructions on how to do so effectively. If the symptoms are moderate, severe or concerning, recommend seeing a doctor but also explain why it's important to seek medical attention in those cases. The case when you are not recommending a doctor visit, make sure to provide detailed home care instructions and specific warning signs that would indicate the need to seek medical attention. This way, users can feel empowered to manage their symptoms at home while also knowing exactly when to escalate to professional care if their condition worsens or does not improve as expected.
+- Paragraph 2: One empathetic sentence. One sentence to see a doctor if needed.
 
 FORBIDDEN — do not include any of these in your response:
 - "Would you like me to find" 
@@ -343,7 +361,12 @@ RULES ALWAYS:
         verbose=False,
     )
 
-    # ── Step 6: Run crew ───────────────────────────────────────────────────────
+    # ── Step 6: Run crew with LangSmith tracing ──────────────────────────────
+    # Set litellm to send LLM call traces to LangSmith.
+    # litellm reads LANGCHAIN_TRACING_V2 + LANGSMITH_API_KEY from env
+    # and sends each completion as a "llm" run type to LangSmith.
+    # These appear in Tracing > Runs tab filtered by run_type=llm.
+    _setup_litellm_langsmith()
     try:
         result = await asyncio.get_event_loop().run_in_executor(
             None, crew.kickoff

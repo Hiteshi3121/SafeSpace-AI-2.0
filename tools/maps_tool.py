@@ -6,10 +6,19 @@ SETUP: Add GOOGLE_MAPS_API_KEY to .env and enable Places API in Google Cloud Con
 """
 
 import logging
+import os
 import requests
 from crewai.tools import BaseTool
 from pydantic import BaseModel, Field
 from core.config import get_settings
+
+def _get_traceable():
+    """Lazy import so tool works even if langsmith not installed."""
+    try:
+        from langsmith import traceable
+        return traceable
+    except ImportError:
+        return lambda *a, **k: (lambda f: f)
 
 logger   = logging.getLogger(__name__)
 settings = get_settings()
@@ -36,6 +45,19 @@ class FindTherapistsTool(BaseTool):
     args_schema: type[BaseModel] = TherapistSearchInput
 
     def _run(self, location: str, specialty: str = "therapist psychiatrist counselor") -> str:
+        traceable = _get_traceable()
+
+        @traceable(name="find_nearby_therapists", run_type="tool",
+                   metadata={"location": location, "specialty": specialty})
+        def _traced_run():
+            return self._run_impl(location, specialty)
+
+        try:
+            return _traced_run()
+        except Exception:
+            return self._run_impl(location, specialty)
+
+    def _run_impl(self, location: str, specialty: str = "therapist psychiatrist counselor") -> str:
         # MCP bridge
         mcp_url = getattr(settings, "therapist_mcp_url", "")
         if mcp_url:
