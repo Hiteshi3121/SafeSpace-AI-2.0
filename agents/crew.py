@@ -186,24 +186,6 @@ def _extract_location_with_llm(user_text: str) -> str | None:
 
 
 
-def _setup_litellm_langsmith() -> None:
-    """
-    Explicitly register LangSmith as a LiteLLM success callback.
-    This ensures every Groq LLM call goes to LangSmith as an "llm" run.
-    These appear in LangSmith Tracing > Runs tab (filter run_type=llm).
-    The Monitoring > LLM Calls tab requires nested parent runs which
-    requires CrewAI version > 1.14.4 (blocked by cache_breakpoint bug).
-    """
-    try:
-        import litellm
-        if "langsmith" not in (litellm.success_callback or []):
-            litellm.success_callback = ["langsmith"]
-        if "langsmith" not in (litellm._async_success_callback or []):
-            litellm._async_success_callback = ["langsmith"]
-    except Exception:
-        pass  # non-fatal — tracing is best-effort
-
-
 async def run_crew(
     user_text: str,
     session: UserSession,
@@ -362,14 +344,24 @@ RULES ALWAYS:
     )
 
     # ── Step 6: Run crew with LangSmith tracing ──────────────────────────────
-    # Set litellm to send LLM call traces to LangSmith.
-    # litellm reads LANGCHAIN_TRACING_V2 + LANGSMITH_API_KEY from env
-    # and sends each completion as a "llm" run type to LangSmith.
-    # These appear in Tracing > Runs tab filtered by run_type=llm.
-    _setup_litellm_langsmith()
+    # CRITICAL: litellm.success_callback must be set INSIDE the executor
+    # thread — not in the main async thread. Python's litellm module
+    # uses threading.local() for some state, so setting callbacks in the
+    # main thread doesn't propagate to the thread where crew.kickoff() runs.
+    def _kickoff_with_langsmith_tracing():
+        """Run crew.kickoff() with LangSmith callback active in this thread."""
+        try:
+            import litellm as _litellm
+            # Register langsmith callback in THIS thread where LLM calls happen
+            if "langsmith" not in (_litellm.success_callback or []):
+                _litellm.success_callback = list(_litellm.success_callback or []) + ["langsmith"]
+        except Exception:
+            pass  # non-fatal
+        return crew.kickoff()
+
     try:
         result = await asyncio.get_event_loop().run_in_executor(
-            None, crew.kickoff
+            None, _kickoff_with_langsmith_tracing
         )
         response_text = str(result.raw) if hasattr(result, 'raw') else str(result)
         response_text = _clean_crew_response(response_text)
