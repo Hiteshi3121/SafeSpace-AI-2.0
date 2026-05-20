@@ -101,6 +101,23 @@ Return ONLY the JSON object. No extra text, no markdown, no code blocks.
 # ── Main function ─────────────────────────────────────────────────────────────
 
 async def classify_intent(user_text: str) -> IntentResult:
+    traceable = _get_traceable()
+
+    @traceable(
+        name="intent_classification",
+        run_type="llm",
+        metadata={"model": "groq/llama-3.3-70b-versatile", "mode": "json_object"},
+    )
+    async def _traced():
+        return await _classify_intent_impl(user_text)
+
+    try:
+        return await _traced()
+    except Exception:
+        return await _classify_intent_impl(user_text)
+
+
+async def _classify_intent_impl(user_text: str) -> IntentResult:
     """
     Classify the intent of a user message using Groq structured output.
 
