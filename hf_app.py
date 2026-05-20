@@ -53,9 +53,15 @@ try:
         "LANGSMITH_API_KEY":    _s.langsmith_api_key,
         "LANGCHAIN_TRACING_V2": "true" if _s.langsmith_api_key else "false",
         "LANGCHAIN_PROJECT":    _s.langsmith_project,
-        # Point maps_tool.py to the MCP server running internally on port 8001
-        # This makes TherapistAgent use MCP → Google Maps instead of direct call
         "THERAPIST_MCP_URL":    "http://127.0.0.1:8001",
+        # Disable CrewAI's own telemetry system.
+        # CrewAI 1.14.4 intercepts and resets litellm.success_callback
+        # after every crew.kickoff(), which removes our "langsmith" callback.
+        # These env vars stop CrewAI from managing litellm callbacks so
+        # our LangSmith callback can fire correctly.
+        "OTEL_SDK_DISABLED":          "true",
+        "CREWAI_TELEMETRY_ENABLED":   "false",
+        "CREWAI_TRACING_ENABLED":     "false",
     }.items():
         if v:
             os.environ.setdefault(k, v)
