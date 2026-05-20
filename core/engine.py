@@ -7,7 +7,7 @@ import logging
 from core.schemas import ChatRequest, ChatResponse, Intent, MessageType
 from core.config import get_settings
 from memory.store import get_session, save_message
-from observability.tracer import trace_request, log_intent
+from observability.tracer import trace_request, update_trace, close_trace_error, log_intent
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -17,19 +17,18 @@ async def handle_request(request: ChatRequest) -> ChatResponse:
     """
     Central coordinator. Every channel (WhatsApp, Streamlit) calls this.
 
-    TRACING:
-    trace_request() creates a parent LangSmith run and sets
-    LANGCHAIN_PARENT_RUN_ID in os.environ. LiteLLM reads this env var
-    before every Groq API call and attaches those runs as children →
-    LLM Calls, Cost & Tokens tabs populate in LangSmith dashboard.
+    LangSmith trace per request:
+      Input:  user_id, channel, message_type
+      Output: channel, intent, confidence, text, escalated
     """
-    channel = "whatsapp" if "whatsapp" in request.user_id else "web"
+    channel      = "whatsapp" if "whatsapp" in request.user_id else "web"
+    message_type = request.message_type.value if request.message_type else "text"
 
     with trace_request(
         user_id=request.user_id,
         channel=channel,
-        message_type=request.message_type.value if request.message_type else "text",
-    ) as run_id:
+        message_type=message_type,
+    ) as run_ctx:
         try:
             user_text = await _resolve_text(request)
             if not user_text:
@@ -47,14 +46,8 @@ async def handle_request(request: ChatRequest) -> ChatResponse:
                 user_id=request.user_id,
             )
 
-            # Update LangSmith parent run with intent from result
-            log_intent(
-                user_id=request.user_id,
-                intent=result.intent.value if result.intent else "unknown",
-                confidence=1.0,
-                channel=channel,
-                run_id=run_id,
-            )
+            # Update LangSmith run with full output fields
+            update_trace(run_ctx, result, channel)
 
             await save_message(request.user_id, role="user",      content=user_text)
             await save_message(request.user_id, role="assistant",  content=result.text)
@@ -62,7 +55,9 @@ async def handle_request(request: ChatRequest) -> ChatResponse:
             return result
 
         except Exception as e:
-            logger.exception("Unhandled error in engine for user %s", request.user_id)
+            logger.exception("Unhandled error in engine for user %s",
+                             request.user_id)
+            close_trace_error(run_ctx, str(e))
             return ChatResponse(
                 text="I'm sorry, something went wrong. Please try again in a moment.",
                 error=str(e),

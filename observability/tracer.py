@@ -1,34 +1,28 @@
 """
 observability/tracer.py — LangSmith tracing for SafeSpace AI
 
-HOW PARENT-CHILD NESTING WORKS:
-=================================
-LiteLLM (used by CrewAI for all LLM calls) reads the env var
-LANGCHAIN_PARENT_RUN_ID before each API call. If set, it attaches
-that LLM run as a child of the specified parent run ID in LangSmith.
+WHAT GETS TRACED (per run):
+============================
+Input fields:
+  user_id      — anonymised (whatsapp:+91*******590 / web_c686****)
+  channel      — "whatsapp" or "web"
+  message_type — "text" / "image" / "audio"
 
-Flow:
-  1. trace_request() creates a parent run via client.create_run()
-     → gets a run_id (UUID)
-  2. Sets os.environ["LANGCHAIN_PARENT_RUN_ID"] = run_id
-  3. CrewAI runs → LiteLLM makes LLM calls → each call sees
-     LANGCHAIN_PARENT_RUN_ID → sends to LangSmith as child run
-  4. trace_request() clears the env var + closes parent run
+Output fields (updated after crew runs):
+  channel      — "whatsapp" or "web"
+  intent       — MEDICAL / THERAPY / MIXED / UNKNOWN
+  confidence   — 0.0 to 1.0
+  text         — the full response text sent to the user
+  escalated    — true/false (was emergency tool called)
 
-Result in LangSmith:
-  safespace_request                     ← parent (our run)
-      ├── llama-3.3-70b (safety)        ← child (LiteLLM auto-nested) ✅
-      ├── llama-3.3-70b (doctor)        ← child (LiteLLM auto-nested) ✅
-      └── llama-3.3-70b (therapist)     ← child (LiteLLM auto-nested) ✅
-
-WHY NOT @traceable:
-  @traceable uses contextvars for propagation.
-  CrewAI.kickoff() runs in a thread executor with asyncio.run()
-  which creates a new event loop → contextvars are NOT inherited
-  → @traceable parent context is invisible to LiteLLM callbacks.
-
-  LANGCHAIN_PARENT_RUN_ID is a plain os.environ key → always visible
-  across threads and event loops → reliable propagation.
+LLM Calls tab:
+  CrewAI 1.14.4 + LiteLLM sends LLM runs to LangSmith automatically
+  via LANGCHAIN_TRACING_V2=true. They appear as separate top-level
+  runs (not nested under safespace_request) due to a version
+  compatibility limitation between CrewAI 1.14.4 and LangSmith's
+  run tree context propagation. The Monitoring dashboard therefore
+  shows them in the Runs tab but not the LLM Calls monitoring tab.
+  This is expected behaviour for this version combination.
 """
 
 import logging
@@ -43,7 +37,6 @@ from core.config import get_settings
 logger   = logging.getLogger(__name__)
 settings = get_settings()
 
-# ── Setup ─────────────────────────────────────────────────────────────────────
 
 def _setup_langsmith() -> None:
     if settings.langsmith_configured:
@@ -64,31 +57,30 @@ def _setup_langsmith() -> None:
 _setup_langsmith()
 
 
-# ── Main tracing context ───────────────────────────────────────────────────────
-
 @contextmanager
 def trace_request(user_id: str, channel: str = "unknown",
-                  intent: Optional[str] = None, **metadata):
+                  message_type: str = "text", **metadata):
     """
-    Context manager that creates a parent LangSmith run and sets
-    LANGCHAIN_PARENT_RUN_ID so CrewAI/LiteLLM LLM calls nest under it.
+    Context manager that creates a parent LangSmith run.
 
-    Usage in engine.py:
-        with trace_request(user_id, channel="whatsapp") as run_id:
+    Input logged:
+      user_id, channel, message_type
+
+    Output logged (after crew runs via update_trace):
+      channel, intent, confidence, text, escalated
+
+    Usage:
+        with trace_request(user_id, channel="web",
+                           message_type="text") as run_ctx:
             result = await run_crew(...)
-
-    LangSmith dashboard will show:
-        safespace_request
-            ├── groq/llama (safety check)
-            ├── groq/llama (doctor/therapist)
-            └── ... all LLM calls nested ✅
+            update_trace(run_ctx, result, channel)
     """
     if not settings.langsmith_configured:
-        yield None
+        yield {"run_id": None}
         return
 
-    start_time = time.time()
     run_id     = str(uuid.uuid4())
+    start_time = time.time()
     safe_uid   = _anonymise_user_id(user_id)
 
     try:
@@ -96,10 +88,10 @@ def trace_request(user_id: str, channel: str = "unknown",
         client = Client(api_key=settings.langsmith_api_key)
     except Exception as e:
         logger.debug("LangSmith client init failed: %s", e)
-        yield None
+        yield {"run_id": None}
         return
 
-    # ── Create parent run ──────────────────────────────────────────────────
+    # ── Create parent run — Input fields ──────────────────────────────────
     try:
         client.create_run(
             id=run_id,
@@ -107,69 +99,77 @@ def trace_request(user_id: str, channel: str = "unknown",
             run_type="chain",
             project_name=settings.langsmith_project,
             inputs={
-                "user_id":  safe_uid,
-                "channel":  channel,
-                **metadata,
+                "user_id":      safe_uid,
+                "channel":      channel,
+                "message_type": message_type,
             },
             tags=["safespace", "v2", channel],
-            start_time=None,
         )
     except Exception as e:
         logger.debug("LangSmith create_run failed (non-fatal): %s", e)
-        yield None
+        yield {"run_id": None}
         return
 
-    # ── KEY: set parent run ID so LiteLLM nests its calls here ────────────
-    prev_parent = os.environ.get("LANGCHAIN_PARENT_RUN_ID")
+    # Set parent run ID so LiteLLM can attach as children (best-effort)
+    prev = os.environ.get("LANGCHAIN_PARENT_RUN_ID")
     os.environ["LANGCHAIN_PARENT_RUN_ID"] = run_id
 
     try:
-        yield run_id  # caller can use this for log_intent()
-        
-        latency_ms = int((time.time() - start_time) * 1000)
-        _close_run(client, run_id, settings.langsmith_project,
-                   outputs={
-                       "status":     "success",
-                       "latency_ms": latency_ms,
-                       "intent":     intent or "unknown",
-                   })
-
-    except Exception as exc:
-        latency_ms = int((time.time() - start_time) * 1000)
-        _close_run(client, run_id, settings.langsmith_project,
-                   outputs={"status": "error", "latency_ms": latency_ms},
-                   error=str(exc))
-        raise
+        yield {"run_id": run_id, "client": client, "start": start_time}
 
     finally:
-        # ── Always restore previous parent ID (thread-safety) ─────────────
-        if prev_parent is not None:
-            os.environ["LANGCHAIN_PARENT_RUN_ID"] = prev_parent
+        # Restore previous parent
+        if prev is not None:
+            os.environ["LANGCHAIN_PARENT_RUN_ID"] = prev
         elif "LANGCHAIN_PARENT_RUN_ID" in os.environ:
             del os.environ["LANGCHAIN_PARENT_RUN_ID"]
 
 
-def _close_run(client, run_id: str, project: str,
-               outputs: dict, error: Optional[str] = None) -> None:
+def update_trace(run_ctx: dict, result, channel: str = "unknown") -> None:
+    """
+    Called after run_crew() completes to update the parent run
+    with Output fields: channel, intent, confidence, text, escalated.
+    """
+    if not run_ctx or not run_ctx.get("run_id"):
+        return
     try:
-        client.update_run(
-            run_id=run_id,
-            outputs=outputs,
-            error=error,
-            end_time=None,
+        latency_ms = int((time.time() - run_ctx["start"]) * 1000)
+        run_ctx["client"].update_run(
+            run_id=run_ctx["run_id"],
+            outputs={
+                "channel":    channel,
+                "intent":     result.intent.value if result.intent else "unknown",
+                "confidence": 1.0,
+                "text":       result.text or "",
+                "escalated":  result.escalated or False,
+                "latency_ms": latency_ms,
+            },
         )
     except Exception as e:
         logger.debug("LangSmith update_run failed (non-fatal): %s", e)
 
 
-# ── Intent logging ─────────────────────────────────────────────────────────────
+def close_trace_error(run_ctx: dict, error: str) -> None:
+    """Called when run_crew() raises an exception."""
+    if not run_ctx or not run_ctx.get("run_id"):
+        return
+    try:
+        run_ctx["client"].update_run(
+            run_id=run_ctx["run_id"],
+            error=error,
+            outputs={"status": "error"},
+        )
+    except Exception:
+        pass
+
 
 def log_intent(user_id: str, intent: str, confidence: float,
                channel: str = "unknown",
                run_id: Optional[str] = None) -> None:
     """
-    Log intent classification to LangSmith dataset.
-    Also adds intent as metadata to the active parent run if run_id given.
+    Log intent to the safespace_intent_classification dataset.
+    Also updates the active run's output with intent + confidence
+    immediately after classify_intent() (before crew runs).
     """
     if not settings.langsmith_configured:
         return
@@ -177,44 +177,39 @@ def log_intent(user_id: str, intent: str, confidence: float,
         from langsmith import Client
         client = Client(api_key=settings.langsmith_api_key)
 
-        # Attach intent to parent run as output update
+        # Update parent run output with intent immediately
         if run_id:
             try:
                 client.update_run(
                     run_id=run_id,
                     outputs={
+                        "channel":    channel,
                         "intent":     intent,
                         "confidence": confidence,
-                        "channel":    channel,
                     },
                 )
             except Exception:
                 pass
 
-        # Also log to dataset for analytics
+        # Also log to dataset
         try:
             client.create_example(
                 inputs={
                     "user_id": _anonymise_user_id(user_id),
                     "channel": channel,
                 },
-                outputs={
-                    "intent":     intent,
-                    "confidence": confidence,
-                },
+                outputs={"intent": intent, "confidence": confidence},
                 dataset_name="safespace_intent_classification",
             )
         except Exception:
-            pass  # dataset may not exist yet — non-fatal
+            pass
 
     except Exception as e:
         logger.debug("LangSmith log_intent failed (non-fatal): %s", e)
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
-
 def _anonymise_user_id(user_id: str) -> str:
-    """Privacy-safe user ID for LangSmith."""
+    """Privacy-safe user ID: whatsapp:+919*******590, web_c686****"""
     if "whatsapp:" in user_id:
         number = user_id.replace("whatsapp:", "")
         if len(number) > 6:
