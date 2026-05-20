@@ -93,6 +93,8 @@ def _detect_location_followup(user_text: str, session) -> str | None:
         return None
 
     # Did the AI ask for a city in any phrasing?
+    # NOTE: must match whatever the TherapistAgent actually outputs —
+    # the agent often varies the phrasing so we cast a wide net here.
     asked_for_city = any(phrase in last_ai.lower() for phrase in [
         "reply with your city",
         "reply with your city name",
@@ -100,6 +102,13 @@ def _detect_location_followup(user_text: str, session) -> str | None:
         "what city are you in",
         "your city name",
         "city name",
+        "find a therapist near you",   # catches "Would you like me to find a therapist near you?"
+        "therapist near you",          # catches varied phrasings
+        "find you a therapist",
+        "nearest therapist",
+        "therapist in your area",
+        "therapist near",
+        "find therapist",
     ])
     if not asked_for_city:
         return None
@@ -238,6 +247,9 @@ Check for: suicidal ideation, self-harm intent, life-threatening medical emergen
 
     doctor_task = Task(
         description=f"""
+CRITICAL INSTRUCTION: Do NOT ask the user for their city or location.
+Do NOT offer to find nearby doctors or specialists. Just give medical guidance.
+
 Provide medical guidance for this user.
 
 CONVERSATION HISTORY:
@@ -246,24 +258,49 @@ CONVERSATION HISTORY:
 CURRENT MESSAGE: "{user_text}"
 
 Safety check result is in your context. The user is not in crisis.
-Follow your guardrails: never diagnose, recommend seeing a doctor for serious concerns.
 
-RESPONSE STRUCTURE (strictly follow this split):
-- Paragraph 1 (80%): Medical information — possible causes, practical home care,
-  warning signs to watch, when to see a doctor. Be specific, not generic.
-- Paragraph 2 (10%): ONE brief empathetic sentence only. Nothing more.
-- Paragraph 3 (10%): "Would you like me to find nearby doctors or specialists?
-  If yes, reply with your city name." — say this ONLY if relevant.
+RESPONSE: 2 paragraphs only.
+- Paragraph 1: Medical info — causes, home care, warning signs. Be specific.
+- Paragraph 2: One empathetic sentence. One sentence to see a doctor if needed.
 
-RULES:
-- Maximum 3 paragraphs total
-- No repeating the user's symptoms back
-- No filler like "I understand how you feel" taking up the main space
+FORBIDDEN — do not include any of these in your response:
+- "Would you like me to find" 
+- "nearby doctors"
+- "reply with your city"
+- "city name"
+- Any offer to search or find professionals
         """,
-        expected_output="Medical guidance: 80% medical info, 10% empathy, 10% doctor search offer.",
+        expected_output="2 paragraphs: medical info + brief empathy/advice. No location offers whatsoever.",
         agent=doctor_agent,
         context=[safety_task],
     )
+
+    # Check if a location is present in current message or recent history
+    # so we can tell the agent explicitly whether to search or not
+    _has_location = _detect_location_followup(user_text, session) is not None or                     any(w in user_text.lower() for w in [
+                        "nagpur","mumbai","pune","delhi","hyderabad","bangalore",
+                        "bengaluru","chennai","kolkata","lucknow","kanpur",
+                        "wadi","banjara","koregaon","andheri","bandra",
+                    ])
+
+    if _has_location:
+        _tool_instruction = f"""
+IMPORTANT — TOOL SEARCH REQUIRED:
+A location was mentioned. You MUST call find_nearby_therapists NOW with the
+location from the current message: "{user_text}"
+After calling the tool, your ENTIRE response must be:
+- ONE warm sentence (e.g. "Here are some mental health professionals near you:")
+- The FULL clinic list exactly as returned by the tool (names, addresses, ratings)
+- The helpline numbers at the end
+Do NOT give a coping technique. Do NOT ask for city again. ONLY show the clinics."""
+    else:
+        _tool_instruction = """
+No location provided yet. Do NOT call any tool.
+Response structure:
+- Paragraph 1 (10%): ONE sentence validating their feeling.
+- Paragraph 2 (80%): ONE specific coping technique. Be specific.
+- Paragraph 3 (10%): "Would you like me to find a therapist near you?
+  If yes, reply with your city name." """
 
     therapist_task = Task(
         description=f"""
@@ -276,20 +313,14 @@ CURRENT MESSAGE: "{user_text}"
 
 Safety check result is in your context. The user is not in crisis.
 
-RESPONSE STRUCTURE (strictly follow this split):
-- Paragraph 1 (10%): ONE sentence validating their feeling. Brief only.
-- Paragraph 2 (80%): Practical help — specific coping technique, CBT reframing,
-  breathing exercise, or ONE focused actionable step. Be specific, not generic.
-- Paragraph 3 (10%): "Would you like me to find a therapist near you?
-  If yes, reply with your city name."
+{_tool_instruction}
 
-RULES:
+RULES ALWAYS:
 - Maximum 3 paragraphs total
-- Do NOT use more than one sentence for validation
+- Do NOT repeat a coping technique already given in conversation history
 - Do NOT repeat the user's words back to them
-- Pick ONE best suggestion, not multiple options
         """,
-        expected_output="Support: 10% validation, 80% practical help, 10% therapist search offer.",
+        expected_output="If location given: ONLY the clinic list from tool. If no location: support + ask for city.",
         agent=therapist_agent,
         context=[safety_task],
     )
