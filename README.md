@@ -6,6 +6,8 @@ Output recoeding of WhatsApp (HF/backend) - https://drive.google.com/file/d/1sTE
 
 <img width="214" height="430" alt="image" src="https://github.com/user-attachments/assets/c32e6c0e-65c0-489c-9fea-f34609224996" />
 
+<img width="152" height="385" alt="image" src="https://github.com/user-attachments/assets/8815e3f6-32ac-4f35-a402-cbaeda8e09ac" />
+
 <img width="832" height="418" alt="image" src="https://github.com/user-attachments/assets/e157c9c4-a091-4601-aaa5-0e6cbccd8c2d" />
 
 
