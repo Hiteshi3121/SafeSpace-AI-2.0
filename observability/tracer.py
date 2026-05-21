@@ -137,8 +137,8 @@ def update_trace(run_ctx: dict, result, channel: str = "unknown") -> None:
         run_ctx["client"].update_run(
             run_id=run_ctx["run_id"],
             outputs={
-                "channel":    channel,
                 "intent":     result.intent.value if result.intent else "unknown",
+                "channel":    channel,
                 "confidence": 1.0,
                 "text":       result.text or "",
                 "escalated":  result.escalated or False,
